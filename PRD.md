@@ -1,8 +1,8 @@
 # PRD: `ndex` — Deep File Indexer for Archival Storage
 
 **Version:** 0.3.0-draft
-**Date:** 2026-03-17
-**Status:** Draft
+**Date:** 2026-03-23
+**Status:** Draft (pre-implementation amendments applied 2026-03-23)
 
 ---
 
@@ -113,7 +113,9 @@ A persistent `ndexd` daemon was considered and rejected:
 
 ### 5.1 Decision
 
-**Use BLAKE3 as the single hash for all purposes.** No xxHash3, no split strategy.
+**Use BLAKE3 as the single hash for all content hashing purposes.** No xxHash3, no split strategy.
+
+> **Scope clarification:** "BLAKE3 Everywhere" means content hashing only — file integrity, dedup, model verification. xxHash3-64 is still used as a non-cryptographic path lookup accelerator in the `path_hash` column of `manifest.db` (see §11.1). This is an internal implementation detail, not a content hash — it is not stored alongside files and has no integrity meaning.
 
 ### 5.2 Rationale
 
@@ -131,35 +133,47 @@ The v0.2 draft proposed xxHash3-128 for speed on the reconciliation fast path an
 
 ### 5.3 When BLAKE3 Is Computed
 
-BLAKE3 is computed **exactly once per file, during the extraction phase (Phase 3).** The extraction workers are already reading the file from disk to extract text. They hash the raw bytes as a streaming side-effect of reading:
+BLAKE3 is computed **exactly once per file, during the extraction phase (Phase 3).** The extraction workers read the entire file into memory (or via mmap), hash the raw bytes with BLAKE3, then pass the bytes to the format-specific extractor.
+
+> **Architecture note:** BLAKE3 hashing is streaming and forward-only. However, most format extractors are **not** — PDF parsers need random access (xref table at EOF), DOCX is a ZIP archive (central directory at end), and tree-sitter parses full in-memory buffers. The actual pattern is: read all bytes into a buffer (or mmap the file), hash the buffer, then extract from the buffer. The conceptual "streaming side-effect" applies only to plaintext and simple line-based formats.
 
 ```rust
 fn process_file(path: &Path) -> Result<ProcessedFile> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::with_capacity(1 << 20, file);  // 1 MB buffer
-    let mut hasher = blake3::Hasher::new();
-    let mut extractor = get_extractor(mime_type);
+    // Read full file into memory — required by most extractors (PDF xref, ZIP CD, tree-sitter)
+    let bytes = std::fs::read(path)?;
 
-    loop {
-        let buf = reader.fill_buf()?;
-        if buf.is_empty() { break; }
-        hasher.update(buf);                   // hash the raw bytes
-        extractor.feed(buf)?;                 // feed to format-specific extractor
-        let len = buf.len();
-        reader.consume(len);
-    }
+    // BLAKE3 is streaming-capable but we hash the full buffer for simplicity
+    let hash = blake3::hash(&bytes);
 
-    let hash = hasher.finalize();
-    let text = extractor.finish()?;
+    // Extractor receives full bytes; format determines whether it needs random access
+    let extractor = get_extractor(mime_type);
+    let text = extractor.extract(&bytes)?;
+
     Ok(ProcessedFile { hash, text, ... })
 }
 ```
+
+For very large files (up to `max_file_size`, default 2 GiB), memory-mapped I/O (`mmap`) is used instead of reading into a heap buffer. BLAKE3 hashes the mmap'd bytes directly via `update_rayon()` for parallelism.
 
 No separate "hashing pass." No lazy computation. No optional anything. Every indexed file has a BLAKE3 hash, period.
 
 **For files that fail extraction** (status = 2 or 4): We still compute the hash during the read attempt. Even if text extraction fails, the hash is stored. This enables dedup detection even for files we can't read.
 
 BLAKE3 hashes are stored in the `blake3` column of the `files` table in `manifest.db`. For `ndex verify`, hashes are read from the manifest and compared against freshly computed hashes.
+
+### 5.4 Library Selection for Format Extraction
+
+| Format | Primary library | Rationale |
+|---|---|---|
+| PDF | `pdf_oxide` | Actively maintained (2026-01-07 release), 5× faster than `pdf-extract`, 100% pass rate on 3,830 real-world PDFs |
+| PDF (fallback) | `pdfium` | Handles edge cases pdf_oxide cannot; requires bundled native lib |
+| DOCX | `docx-rust` | Full reading support for paragraph styles, headings, tables; `docx-rs` (bokuweb) is primarily a writer |
+| DOCX (v0.1 fallback) | Best-effort paragraph splitting | If structured extraction fails, fall back to paragraph-boundary splitting |
+| Markdown | `pulldown-cmark` | Widely used, battle-tested |
+| HTML | `lol-html` | Streaming; `scraper` for DOM queries when structure needed |
+| Code | `tree-sitter` | Parses full in-memory buffer; language-specific grammars |
+
+> **v0.1 scope:** For DOCX, accept best-effort structure extraction. If `docx-rust` cannot extract heading styles (e.g., malformed file), fall back to paragraph-boundary splitting. Log a warning and set `status=2` (failed_transient) only if no text can be extracted at all.
 
 ### 5.5 Chunking Strategy
 
@@ -184,8 +198,8 @@ BLAKE3 hashes are stored in the `blake3` column of the `files` table in `manifes
 |---|---|---|
 | Markdown | `pulldown-cmark` | Headings, code blocks, lists |
 | HTML | `scraper` / `lol-html` | `<h*>`, `<p>`, `<pre>`, `<li>` |
-| PDF | `pdf-extract` / `pdfium` | Section breaks, page breaks |
-| DOCX | `docx-rs` | Paragraph styles, headings |
+| PDF | `pdf_oxide` / `pdfium` (fallback) | Section breaks, page breaks |
+| DOCX | `docx-rust` (reading) | Paragraph styles, headings |
 | Code | `tree-sitter` | Functions, classes, modules |
 | Plaintext | Recursive splitter | `\n\n` > `\n` > `. ` > ` ` |
 | Logs | Line-based | Timestamp patterns, fixed line batches |
@@ -233,6 +247,53 @@ heading_prefix = true   # prepend section heading to each chunk
 [extraction]
 max_file_size = "2GiB"
 ```
+
+### 5.7 Embedding Pipeline
+
+#### Hardware
+
+**v0.1 is CPU-only.** ONNX Runtime uses multi-threaded CPU inference. CUDA/ROCm GPU acceleration is deferred to v0.2.
+
+#### Query Prefix
+
+`snowflake-arctic-embed-m-v2.0` uses asymmetric embedding: documents and queries use different prefixes. ndex applies these automatically:
+
+| Use | Prefix |
+|---|---|
+| Document chunks (at index time) | *(none)* |
+| Search queries (at search time) | `"Represent this sentence for searching relevant passages: "` |
+
+Omitting the query prefix degrades retrieval quality significantly. The prefix is hardcoded per model and not user-configurable.
+
+#### Tokenizer
+
+The `tokenizer.json` bundled with each model (HuggingFace format, loaded via `tokenizers` crate) is used for:
+- **Token counting** during chunking (§5.5): chunks are sized in model tokens, not characters
+- **Tokenization** before ONNX inference
+
+#### Query Flow
+
+1. User issues `ndex search /pool "quarterly earnings"`
+2. Client sends `SearchRequest { query: "quarterly earnings", mode: Auto, ... }` to server
+3. Server applies mode heuristics (§11.7) to determine FTS / semantic / hybrid
+4. For semantic/hybrid: prepend query prefix, tokenize, run ONNX inference → 768d vector → MRL truncate to 256d → L2 normalize → USearch ANN query
+5. Results merged and returned
+
+#### Query Length and Truncation
+
+Max query length: **512 tokens** (model limit). Queries exceeding this are truncated with a warning. In practice, search queries are short (5-15 tokens); this limit is never reached in normal use.
+
+#### Batch Size and Throughput
+
+At index time, chunks are batched for inference:
+
+```toml
+[embedding]
+batch_size = 64        # chunks per ONNX inference call
+threads = 0            # 0 = use all CPU cores (via ONNX Runtime thread pool)
+```
+
+Throughput on a 16-core server: ~4,000 chunks/sec. At 512 tokens/chunk, this is the primary bottleneck for large text archives.
 
 ---
 
@@ -309,7 +370,7 @@ fn open_index(root: &Path, my_version: &Version) -> Result<Index> {
     if identity.model_name != current_model_name() {
         // Vectors are unusable but FTS still works
         warn!("Embedding model mismatch: index uses {}, binary has {}. \
-               Semantic search disabled. Run `ndex-remote reindex --vectors` to re-embed.",
+               Semantic search disabled. Run `ndex reindex --vectors` to re-embed.",
               identity.model_name, current_model_name());
     }
 
@@ -380,7 +441,9 @@ timeout_secs = 30                  # max wall time for pre-search reconciliation
 index_new_only = true              # only index new files (skip modified, faster)
 ```
 
-> **Note (HDD users):** The default `timeout_secs = 30` may be insufficient on HDD arrays for large archives (10M+ files). A Phase 1 walk on HDD RAIDZ2 at 10M files takes 3-5 minutes. If you have a large HDD archive and want search to be always current, run `ndex index` explicitly on a schedule (e.g., nightly cron) rather than relying on auto-refresh.
+> **Note (HDD users):** The default `timeout_secs = 30` is useless on HDD arrays at large scale — a Phase 1 walk on HDD RAIDZ2 at 10M files takes 3-5 minutes, so the timeout fires before any files are indexed. The 30-second budget still imposes I/O seek cost on HDD with no benefit.
+>
+> **Rotational media detection:** On Linux, ndex detects rotational storage via `/sys/block/<dev>/queue/rotational`. If the index root is on rotational media and `timeout_secs` is at its default (30), ndex adjusts the effective `auto_refresh.enabled = false` with a one-time warning: "Auto-refresh disabled: rotational storage detected. Run `ndex index` on a schedule for up-to-date results." This avoids the useless I/O overhead. Users can override with `auto_refresh.enabled = true` and a higher `timeout_secs` in config.
 
 **User override flags:**
 
@@ -440,12 +503,18 @@ curl -fsSL https://get.ndex.dev/install.sh | sh -s -- --version 0.1.0 --arch x86
 # Or /usr/local/bin/ndex-remote with --system
 ```
 
+> **Security note:** `curl | sh` is a supply-chain vector. If the release server is compromised, both the binary and its checksum are controlled by the attacker, making checksum verification alone insufficient. Mitigations:
+> - The install script is hosted in the ndex GitHub repository (not an opaque CDN) for transparency and auditability.
+> - Release artifacts are signed with GPG (or sigstore/cosign). The install script verifies the signature against a hardcoded public key before executing.
+> - For security-conscious environments, use Method 3 (manual tarball) and verify the GPG signature out-of-band, or install from a package manager with its own trust chain (Method 2).
+> - The sigstore/cosign public key and verification instructions are published at `https://github.com/ndex-dev/ndex/blob/main/SECURITY.md`.
+
 The install script:
 1. Detects `uname -m` for architecture (x86_64, aarch64)
 2. Detects OS (Linux, macOS, FreeBSD)
 3. Downloads the release tarball from GitHub releases
-4. Extracts `ndex-remote` to the install path
-5. Verifies the binary with a bundled signature or checksum
+4. **Verifies the GPG/cosign signature** against the hardcoded public key
+5. Extracts `ndex-remote` to the install path
 6. Does NOT download the embedding model (that happens automatically on first use — §8.4)
 
 **Method 2: Package manager**
@@ -486,7 +555,7 @@ ndex-remote self-update --check            # just check, don't install
 Self-update process:
 1. Fetch version manifest from release server
 2. Download new binary to a temporary file
-3. Verify checksum
+3. **Verify GPG/cosign signature** (not just checksum — the checksum is only as trustworthy as the server hosting it)
 4. Atomic rename over the old binary (`rename()` on the same filesystem)
 5. Print old → new version
 6. The next SSH session will use the new binary
@@ -511,7 +580,7 @@ $ ndex-remote index /pool/archive
 
   Embedding model 'snowflake-arctic-embed-m-v2.0' not found.
   Downloading to ~/.ndex/models/snowflake-arctic-embed-m-v2.0/...
-  ████████████████████████████░░░░ 100 MB / 130 MB  [3s ETA]
+  ████████████████████████████░░░░ 250 MB / 297 MB  [3s ETA]
 
   Model verified (blake3: a3f2e8...). Ready.
 
@@ -542,7 +611,7 @@ ndex-remote model path arctic                # print the path to the model file
 ```
 ~/.ndex/models/
 ├── snowflake-arctic-embed-m-v2.0/
-│   ├── model.onnx          (~130 MB, INT8)
+│   ├── model.onnx          (~297 MB, INT8)
 │   ├── tokenizer.json      (600 KB)
 │   └── manifest.json       (model metadata, expected hashes)
 └── granite-embedding-small-english-r2/
@@ -555,7 +624,7 @@ ndex-remote model path arctic                # print the path to the model file
 
 | Shortname | Full name | Size (ONNX INT8) | Dims | MRL | Languages | BEIR/MIRACL |
 |---|---|---|---|---|---|---|
-| `arctic` (default) | snowflake-arctic-embed-m-v2.0 | ~130 MB | 768 | yes (256d) | 74 languages | MIRACL 55.2 |
+| `arctic` (default) | snowflake-arctic-embed-m-v2.0 | ~297 MB | 768 | yes (256d) | 74 languages | MIRACL 55.2 |
 | `granite-small` | granite-embedding-small-english-r2 | ~48 MB | 384 | no | English only | BEIR 55.6 |
 
 > **ONNX model sourcing:** ndex downloads pre-built ONNX INT8 models from the ndex GitHub releases (not HuggingFace directly). The release pipeline exports and quantizes models using `optimum-cli`, verifies output dimensions and MRL truncation correctness, and publishes the artifacts alongside each ndex release. This ensures reproducibility and avoids dependency on third-party ONNX exports.
@@ -810,6 +879,8 @@ Split on '/' and '.' → LowerCaser → also emit trigrams per component
 
 CJK: `LinderaTokenizer` (Japanese), `CangJieTokenizer` (Chinese), auto-detected per chunk.
 
+**Unicode normalization:** All indexed text and search queries are NFC-normalized before tokenization (`unicode-normalization` crate). This ensures `café` (NFD: `cafe\u0301`) and `café` (NFC: `caf\u00e9`) match identically. macOS writes NFD paths/content; Linux writes NFC; normalization to NFC at ingest time prevents missed matches across platforms.
+
 **Threading:** Tantivy's `IndexWriter` uses a single writer with internal per-thread document buffers. Multiple extraction workers prepare documents and call `add_document()` concurrently — Tantivy handles the internal synchronization. Only one `IndexWriter` instance should exist per index. Search readers (`IndexReader`) are fully concurrent and lock-free.
 
 ### 11.3 Semantic Vector Index — `vectors/` (USearch)
@@ -819,7 +890,9 @@ CJK: `LinderaTokenizer` (Japanese), `CangJieTokenizer` (Chinese), auto-detected 
 | Dimensions | 256 (MRL truncation of 768d snowflake-arctic-embed-m-v2.0) |
 | Metric | Inner product (on L2-normalized vectors = cosine) |
 | Scalar type | f16 |
-| Storage per vector | 512 bytes (256d × 2 bytes) |
+| Storage per vector (raw) | 512 bytes (256d × 2 bytes) |
+| HNSW graph overhead (M=32) | ~256 bytes/node |
+| **Total per vector** | **~768 bytes** |
 | Connectivity M | 32 |
 | ef_construction | 200 |
 | ef_search | 128 (tunable via `--ef`) |
@@ -960,6 +1033,69 @@ thumbs/{blake3_hex[0:2]}/{file_id}.md.webp   (600x600 max)
 
 **Index overhead: ~0.5% of archive size** for typical mixed-content archives. Higher for text-heavy (all PDFs: ~1-2%). Lower for media-heavy (all photos: ~0.1%).
 
+### 11.7 Search Scoring
+
+#### BM25 (Full-Text Search via Tantivy)
+
+Tantivy uses **BM25** (Best Match 25) for FTS scoring. Parameters: `k1 = 1.2`, `b = 0.75` (Tantivy defaults). BM25 scores reflect term frequency, inverse document frequency, and field length normalization.
+
+**Field boosts** apply at query time:
+```
+score_fts = bm25(title) × title_boost + bm25(body) + bm25(path_text) × 0.5
+```
+Default `title_boost = 2.0`. Configurable via `--fts-boost title:3.0`. The `path_text` boost of 0.5 ensures path matches contribute but don't overwhelm content matches.
+
+#### Cosine Similarity (Semantic Search via USearch)
+
+USearch stores L2-normalized f16 vectors and uses **inner product** as the distance metric. For normalized vectors, inner product equals cosine similarity. Scores are in `[-1.0, 1.0]`; in practice, positive matches range from ~0.6 to 0.99.
+
+#### Reciprocal Rank Fusion (Hybrid Mode)
+
+Hybrid mode merges FTS and semantic results using **Reciprocal Rank Fusion (RRF)**:
+
+```
+rrf_score(d) = 1/(k + rank_fts(d)) + 1/(k + rank_semantic(d))
+```
+
+Where:
+- `k` is the RRF constant (default: 60, configurable via `--rrf-k`). Higher k de-emphasizes rank differences between top and bottom results. `k=60` is the empirically established default from the original RRF paper.
+- `rank_fts(d)` is the 1-based rank of document `d` in the FTS result list (∞ if absent)
+- `rank_semantic(d)` is the 1-based rank in the semantic result list (∞ if absent)
+
+A document only in FTS results gets `1/(k + rank) + 1/(k + ∞) = 1/(k + rank)`. A document in both gets a combined score.
+
+**`--fts-boost` in hybrid mode:** The `--fts-boost` flag applies a multiplier to the FTS component of the RRF sum:
+```
+rrf_score(d) = fts_boost × 1/(k + rank_fts(d)) + 1/(k + rank_semantic(d))
+```
+Default `fts_boost = 1.0`. Set `--fts-boost 2.0` to weight FTS results more heavily (useful for keyword-heavy queries).
+
+#### `auto` Mode Heuristics
+
+The server determines the actual search mode based on query characteristics:
+
+| Query characteristic | Selected mode |
+|---|---|
+| Contains quoted phrases (`"exact phrase"`) | `fts` |
+| Uses FTS operators (`AND`, `OR`, `NOT`, `field:term`) | `fts` |
+| Short (≤ 3 tokens), looks like a keyword | `fts` |
+| Longer natural language (> 3 tokens, no operators) | `hybrid` |
+| Vector index absent or empty | `fts` (fallback with warning) |
+
+The selected mode is reported in `SearchResult.mode` and displayed in the result footer.
+
+#### Score Normalization for Display
+
+Raw BM25 and RRF scores are on incomparable scales. For display, scores are normalized to `[0, 1]` using **min-max normalization** within the returned result set:
+
+```
+display_score = (raw_score - min_score) / (max_score - min_score)
+```
+
+The top result always displays as 1.000; the bottom result (of the returned page) as ~0.000. The example output showing `0.847` reflects this normalized scale — it means "84.7% of the relevance range between the top and bottom result on this page." This is a display convenience only; it does not reflect absolute relevance.
+
+For machine-readable output (`-f json`), raw scores are emitted as `score_raw` alongside `score_display`. The `--explain` flag shows individual FTS BM25, semantic cosine, and RRF component scores.
+
 ---
 
 ## 12. Reconciliation Engine
@@ -996,11 +1132,11 @@ If `ignore.respect_gitignore = false` in config, pass `.git_ignore(false)`.
 
 Produces `DashMap<PathBuf, WalkEntry>` where `WalkEntry = { size, mtime_ns, ctime_ns, inode, dev, mode }`.
 
-> **Memory requirements:** Phase 1 walk and Phase 2 diff hold all file metadata in memory. Estimated ~200 bytes per file entry (path + metadata). At 10M files: ~2 GB RAM. At 50M files: ~10 GB RAM. Systems indexing 50M+ files should have at least 16 GB RAM available for ndex-remote. A streaming/disk-backed approach for very large file counts is deferred to v0.3.
+> **Memory requirements:** Phase 1 walk builds a `DashMap` of all file metadata (~270 bytes/file). Phase 2 diff loads the manifest into a second `HashMap` (~200 bytes/file). Total: ~470 bytes/file across both phases simultaneously. At 10M files: ~5 GB RAM. At 50M files: ~25 GB RAM. Systems indexing 50M+ files should have at least 32 GB RAM available for ndex-remote. Consider querying the manifest via SQLite during diff (rather than loading all into a HashMap) to reduce peak memory — this optimization is deferred to v0.3.
 
-> **Hard limit:** `ndex-remote` checks available system memory before Phase 1. If estimated memory for the walk (file_count_estimate × 200 bytes) exceeds 75% of available RAM, it aborts with a clear error:
+> **Hard limit:** `ndex-remote` checks available system memory before Phase 1. If estimated memory for the reconciliation (file_count_estimate × 500 bytes, accounting for walk map + manifest HashMap) exceeds 75% of available RAM, it aborts with a clear error:
 > ```
-> Error: Estimated 10.2 GB RAM needed for 51M files, but only 7.8 GB available.
+> Error: Estimated 25.5 GB RAM needed for 51M files, but only 7.8 GB available.
 > Options:
 >   - Index a subdirectory: ndex index /pool/archive/docs
 >   - Increase system RAM
@@ -1022,6 +1158,10 @@ Phase 2 is parallelized via `rayon::par_iter()` over walk results. The manifest 
 > Note: xxh3_64 collisions are extremely rare (birthday probability ~0.007% at 50M files), so the `Vec<FileRecord>` per path_hash bucket is almost always length 1. The `Vec` exists for correctness — on collision, the `AND path = ?` check disambiguates. An alternative is `HashMap<u64, FileRecord>` with a separate collision map, but the `Vec` approach is simpler and the overhead is negligible.
 
 **Phase 3: Process** — extract, hash, chunk, embed, index.
+
+> **Hard link dedup (MEDIUM):** Multiple paths may resolve to the same inode (`dev + inode` pair). During Phase 2 diff, track `(dev, inode)` pairs already queued for processing. If a new path maps to an already-queued inode, record the path in the manifest but skip re-extraction — reuse the chunks and vectors from the first occurrence. This prevents phantom duplicates (e.g., a hard-linked file appearing twice in search results).
+
+> **TOCTOU guard (MEDIUM):** After extracting a file, re-stat it and compare `(size, mtime_ns)` against the values captured during Phase 1 walk. If they differ (file was modified between walk and extraction), discard the extraction result and mark the file `status=2` (failed_transient) for retry on the next run. This prevents stale content from being indexed.
 
 Multi-threaded pipeline with backpressure:
 
@@ -1048,6 +1188,15 @@ Crash recovery: resume from `status = 0` files, re-process missing indices per `
 
 `flock()` on `.ndex/lock` for write exclusion. Multiple readers (search sessions) run concurrently — SQLite WAL, tantivy readers, and USearch mmap reads all support concurrent access. Readers never block on a writer (WAL mode — readers see the last committed state).
 
+> **NFS warning:** `flock()` on NFS can silently fail to provide mutual exclusion (depending on NFS version and server configuration) or block indefinitely. At index open time, ndex detects whether `.ndex/` is on an NFS mount via `statfs()`. If NFS is detected, ndex aborts with:
+> ```
+> Error: .ndex/ is on an NFS filesystem. flock() cannot guarantee exclusive access on NFS.
+> The .ndex/ directory must reside on a local filesystem (ZFS, ext4, xfs, etc.).
+> If your archive is on NFS, initialize the index in a local directory:
+>   ndex init /pool/archive --index-dir /local/fast/storage/.ndex
+> ```
+> (The `--index-dir` flag for relocating `.ndex/` is planned for v0.2. For v0.1, document this limitation prominently.)
+
 ### 12.4 Symlink Handling
 
 **Policy:** ndex follows symlinks by default, matching `find -L` behavior. Symlink cycles are detected by tracking `(dev, inode)` pairs during the walk; a cycle is logged as a warning and the symlink target is skipped.
@@ -1060,6 +1209,48 @@ follow_symlinks = true       # default: true
 ```
 
 Set `follow_symlinks = false` to index only regular files and skip all symlinks.
+
+### 12.5 Error Handling Strategy
+
+#### Failure Classification
+
+Each file processing failure is classified as transient or permanent:
+
+| Failure type | Classification | `status` | Retry? |
+|---|---|---|---|
+| I/O error (read timeout, disk error) | Transient | 2 | Yes |
+| Extraction error (malformed PDF, truncated DOCX) | Transient (first 3 attempts) | 2 | Yes (up to limit) |
+| Extraction error (persistent after retry limit) | Permanent | 4 | No |
+| File too large (> `max_file_size`) | Permanent/skipped | 5 | No |
+| Unsupported format | Permanent | 4 | No |
+| Embedding failure (ONNX error) | Critical — stops processing | — | See below |
+| Model load failure | Critical — stops processing | — | See below |
+| Disk full during index write | Critical — stops processing | — | See below |
+| Index corruption detected | Critical — requires reindex | — | See below |
+
+#### Retry Policy
+
+Files with `status = 2` (failed_transient) are retried on the next reconciliation run. After `fail_count` reaches the configured limit, the status is promoted to `status = 4` (failed_permanent):
+
+```toml
+[extraction]
+max_retries = 3    # promote to failed_permanent after this many transient failures
+```
+
+Each retry increments `fail_count` in the manifest. The `error_msg` column stores the last error for diagnostics.
+
+#### Critical Error Handling
+
+Critical errors stop the indexing run immediately and are reported to the user:
+
+- **Model load failure:** ndex-remote exits with a clear message to re-fetch the model (`ndex-remote model fetch --force`). Does not corrupt the index.
+- **Disk full:** ndex-remote aborts after flushing SQLite WAL. Files in `status=0` (intent-written) will be retried on next run (crash recovery per §12.2).
+- **Index corruption:** Detected via SQLite integrity check and USearch header validation on open. If corruption is detected, ndex refuses to proceed and prompts for `ndex reindex`.
+- **ONNX inference error:** A single chunk failing inference is logged and skipped (that chunk gets no vector). If inference errors are persistent (> 10 consecutive failures), the embedding pipeline is halted and `--no-vectors` behavior applies for the remainder of the run.
+
+#### Logging
+
+All errors are logged to stderr. Per-file errors at `WARN` level. Critical errors at `ERROR` level. The `fail_count` and `error_msg` in the manifest provide persistent per-file diagnostics.
 
 ---
 
@@ -1117,7 +1308,7 @@ struct HandshakeResp {
 
 ### 13.4 Message Types
 
-> **Serialization:** Always use `rmp_serde::to_vec_named()` / `rmp_serde::from_slice()`. The `_named` variant serializes field names as strings (required for tagged enum deserialization). Internally tagged enums (`#[serde(tag = "kind")]` without `content`) have known issues in `rmp-serde` and must not be used.
+> **Serialization:** Always use `rmp_serde::to_vec_named()` / `rmp_serde::from_slice()`. The `_named` variant serializes field names as strings (required for tagged enum deserialization). Internally tagged enums (`#[serde(tag = "kind")]` without `content`) have known issues in `rmp-serde` and must not be used. Adjacently tagged enums (`#[serde(tag = "kind", content = "data")]` as used here) also have known deserialization edge cases — **write comprehensive round-trip tests for every message variant before considering the protocol stable.** If issues arise, fall back to externally tagged enums (default serde) or switch to CBOR (`ciborium` crate).
 
 ```rust
 #[derive(Serialize, Deserialize)]
@@ -1189,6 +1380,13 @@ Or specify the path:
 ```
 
 Note: the install command runs ON the server (via SSH), not from the client. No client bandwidth used.
+
+> **SSH host key deadlock prevention:** ndex always passes `-o BatchMode=yes` in its SSH invocation. This causes SSH to fail immediately (exit 255) instead of prompting for host key acceptance — which would deadlock because stdin/stdout are occupied by the msgpack channel. If the host key is not yet trusted, ndex fails with a clear error:
+> ```
+> Error: SSH host key verification failed for 'nas.local'.
+> Accept the host key first: ssh -o BatchMode=no nas.local exit
+> ```
+> Users must accept the host key once via a direct SSH session before using ndex.
 
 ---
 
@@ -1304,7 +1502,7 @@ ndex index [HOST:]<PATH> [OPTIONS]
 ndex init <PATH> [OPTIONS]
 
     --model <MODEL>     multilingual (default) | english-only | none
-                        multilingual = snowflake-arctic-embed-m-v2.0 (~130 MB, 74 langs)
+                        multilingual = snowflake-arctic-embed-m-v2.0 (~297 MB, 74 langs)
                         english-only = granite-embedding-small-english-r2 (48 MB, EN)
     --exclude <PAT>     Gitignore-style exclude (repeatable)
     --no-fts            Disable full-text index
@@ -1542,7 +1740,8 @@ Each file path is an OSC 8 hyperlink (when supported). Matched query terms are h
 - Manifest (SQLite WAL), FTS (tantivy), vectors (USearch + snowflake-arctic-embed-m-v2.0, 256d MRL)
 - Metadata index (doc_meta, media_meta)
 - Extraction: pdf, docx, txt, md, html, code, images (EXIF)
-- CLI: init, index, search (fts/semantic/hybrid), info, stats, reindex
+- CLI: `init`, `index`, `search` (fts/semantic/hybrid), `info`, `stats`, `reindex`, **`delete`**, `config`, `completions`
+- `delete` is v0.1 because users must be able to remove accidentally indexed sensitive files without a full reindex
 - SSH remote with version negotiation
 - Auto-refresh on search
 - Auto model fetch on remote
@@ -1550,12 +1749,31 @@ Each file path is an OSC 8 hyperlink (when supported). Matched query terms are h
 - No-migration index versioning
 - .ndexignore, crash-safe incremental indexing
 
+**Command-to-milestone mapping:**
+
+| Command | Milestone | Notes |
+|---|---|---|
+| `ndex init` | v0.1 | |
+| `ndex index` | v0.1 | |
+| `ndex search` | v0.1 | fts/semantic/hybrid |
+| `ndex info` | v0.1 | |
+| `ndex stats` | v0.1 | |
+| `ndex reindex` | v0.1 | |
+| `ndex delete` | v0.1 | safety valve for sensitive files |
+| `ndex config` | v0.1 | view/edit config; write not required for launch |
+| `ndex completions` | v0.1 | |
+| `ndex verify` | v0.2 | |
+| `ndex tag` | v0.2 | |
+| `ndex dedup` | v0.2 | |
+| `ndex compact` | v0.2 | |
+
 ### v0.2 — Breadth
 
 - CJK tokenizers, archive indexing, email indexing
 - Tags, NER, dedup, verify, compact
 - Thumbnails, CUDA embedding
 - `ndex-remote self-update`
+- `--index-dir` flag for relocating `.ndex/` (NFS mitigation)
 
 ### v0.3 — Scale + Intelligence
 
@@ -1569,8 +1787,105 @@ Each file path is an OSC 8 hyperlink (when supported). Matched query terms are h
 
 ## 17. Open Questions
 
-1. **Multi-root.** Single ndex instance spanning `/pool/photos` + `/pool/docs`. Requires root registry and cross-root dedup. v0.3?
+### v0.1-Critical (must answer before shipping)
 
-2. **Embedding model migration.** Current: schema mismatch → full re-embed via `ndex reindex --vectors`. Should we support old vectors for FTS-only search while re-embedding in background?
+1. **Model download failure mid-stream.** What happens if the model download is interrupted (network drop, disk full)?
+   - **Proposed answer:** Download to a `.tmp` file. On failure, delete the `.tmp`. On next run, restart the download from scratch (no resume). If disk is full, fail with a clear message listing required space. The model is never "partially installed."
 
-3. **Index portability.** All paths are relative to root. Copying `.ndex/` to another machine with the same layout should work. Needs testing.
+2. **CancelRequest behavior.** `CancelRequest` is defined in the protocol (§13.4) but its behavior is unspecified.
+   - **Proposed answer:** On receiving `CancelRequest`, the server finishes the current in-flight extraction (cannot be interrupted safely mid-file), flushes the SQLite WAL, and sends `IndexComplete` with whatever was indexed before the cancel. For search, cancel is a no-op (search completes fast enough). For long-running index operations, the current batch commits and the server exits cleanly.
+
+3. **Search with empty vector index.** On first run, no vectors exist. What does `ndex search` return in `semantic` or `hybrid` mode?
+   - **Proposed answer:** If the vector index is empty (0 entries), semantic mode returns 0 results with a warning: "Vector index is empty. Run `ndex index` to build the index." Hybrid mode falls back to FTS-only with a warning. `auto` mode selects `fts` if the vector index is empty (per the heuristics in §11.7).
+
+4. **Tantivy segment merge configuration.** Tantivy creates many small segments during incremental indexing. Without periodic merging, segment count grows unboundedly, degrading search performance.
+   - **Proposed answer:** After each incremental indexing batch, call `writer.merge()` if segment count exceeds a threshold (default: 8). Full reindex triggers a final `writer.merge().wait()` to produce a single optimized segment. Expose `ndex compact --only fts` for manual merge. Tantivy's `MergePolicy::LogMergePolicy` (the default) handles this automatically — verify it's configured and not disabled.
+
+### v0.3+ (deferred)
+
+5. **Multi-root.** Single ndex instance spanning `/pool/photos` + `/pool/docs`. Requires root registry and cross-root dedup. v0.3.
+
+6. **Embedding model migration.** Current: schema mismatch → full re-embed via `ndex reindex --vectors`. Should we support old vectors for FTS-only search while re-embedding in background? v0.3.
+
+7. **Index portability.** All paths are relative to root. Copying `.ndex/` to another machine with the same layout should work. Needs testing. v0.2.
+
+---
+
+## 18. Logging and Diagnostics
+
+### Log Output
+
+- All logs go to **stderr** (stdout is reserved for search results and machine-readable output).
+- Verbosity levels controlled by `-v` / `-vv` / `-vvv` (maps to `INFO` / `DEBUG` / `TRACE`).
+- Default level: `WARN` (quiet unless something is wrong).
+- Structured log format: `YYYY-MM-DDTHH:MM:SS.mmm LEVEL target: message [key=value ...]`
+- Log filtering via `NDEX_LOG` env var (same syntax as `RUST_LOG`): e.g., `NDEX_LOG=ndex_remote=debug,tantivy=warn`.
+
+### Log File
+
+For long indexing runs, logs can be redirected to a file:
+```bash
+ndex index /pool --log-file /var/log/ndex-index.log
+```
+The log file receives all output (including progress events as structured log lines). stderr still receives `ERROR` and `WARN`.
+
+### Verbosity Semantics
+
+| Level | `-v` flags | Content |
+|---|---|---|
+| `WARN` (default) | (none) | Errors, warnings, per-file failures |
+| `INFO` | `-v` | Phase transitions, batch summaries, timing |
+| `DEBUG` | `-vv` | Per-file processing, embedding batches, SQL queries |
+| `TRACE` | `-vvv` | Raw protocol frames, ONNX tensor shapes, walk entries |
+
+### `ndex doctor`
+
+`ndex doctor [HOST:]<PATH>` performs index health checks:
+- SQLite integrity check on `manifest.db` and `meta.db`
+- USearch header and entry count validation
+- Tantivy segment meta consistency
+- Sidecar entry count vs USearch entry count match
+- Lock file stale check
+- Disk space available vs index size
+
+Output: pass/warn/fail per check, with remediation suggestions. Planned for v0.2.
+
+### Server-Side Config Reference
+
+Complete list of `config.toml` keys (consolidated from §5.5, §5.6, §5.7, §7.2, §12.1, §12.4):
+
+```toml
+[chunking]
+target_tokens = 512
+overlap_tokens = 128
+min_tokens = 32
+heading_prefix = true
+
+[extraction]
+max_file_size = "2GiB"
+max_retries = 3
+
+[embedding]
+batch_size = 64
+threads = 0           # 0 = all available cores
+
+[auto_refresh]
+enabled = true
+threshold = "1h"
+warn_threshold = "7d"
+timeout_secs = 30
+index_new_only = true
+
+[ignore]
+respect_gitignore = true
+respect_ndexignore = true
+
+[walk]
+follow_symlinks = true
+
+[search]
+default_limit = 20
+rrf_k = 60
+fts_boost = 1.0
+ef_search = 128
+```
