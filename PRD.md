@@ -96,7 +96,6 @@ A persistent `ndexd` daemon was considered and rejected:
 │  ├── index.toml        (index identity: schema version, model)   │
 │  ├── config.toml       (user-editable settings)                  │
 │  ├── manifest.db       (SQLite WAL)                              │
-│  ├── hashes.bin        (mmap'd BLAKE3 cache)                     │
 │  ├── content/          (tantivy segments)                        │
 │  ├── vectors/          (usearch HNSW + sidecar)                  │
 │  ├── meta.db           (SQLite: doc/media metadata, tags)        │
@@ -105,6 +104,8 @@ A persistent `ndexd` daemon was considered and rejected:
 ```
 
 **Local mode:** When no `HOST:` prefix is given, `ndex` spawns `ndex-remote` as a local subprocess (not over SSH). Communication uses the same msgpack protocol over stdin/stdout pipes. This means `ndex-remote` must be installed locally for local operation. The thin client never embeds extraction/indexing logic.
+
+`ndex-remote` also works standalone for local-only use. All commands that the thin client proxies are available directly: `ndex-remote search --root /pool "query"`, `ndex-remote index --root /pool`, etc. The thin client adds SSH transport, host aliases, and nicer terminal rendering, but is not required for local operation.
 
 ---
 
@@ -122,7 +123,7 @@ The v0.2 draft proposed xxHash3-128 for speed on the reconciliation fast path an
 
 **BLAKE3 is fast enough.** On modern CPUs with AVX2/AVX-512, BLAKE3 sustains 4-6 GB/s per core. That's within 2x of raw sequential disk read speed on most NVMe drives and well above HDD throughput. We're never CPU-bound on hashing.
 
-**One hash means one codepath.** No confusion about which hash is stored where, no "optional companion file," no "compute on demand" logic. Every file gets one 32-byte BLAKE3 digest, stored in the manifest, also cached in the mmap'd hash file.
+**One hash means one codepath.** No confusion about which hash is stored where, no "optional companion file," no "compute on demand" logic. Every file gets one 32-byte BLAKE3 digest, stored in the `blake3` column of the `files` table in `manifest.db`.
 
 **Collision resistance.** BLAKE3 has a 256-bit output. Birthday bound: collision probability reaches 1-in-10^38 at 10^19 files. At 10 billion files (10^10), the probability is ~10^-58. This is not a concern at any conceivable scale.
 
@@ -158,32 +159,7 @@ No separate "hashing pass." No lazy computation. No optional anything. Every ind
 
 **For files that fail extraction** (status = 2 or 4): We still compute the hash during the read attempt. Even if text extraction fails, the hash is stored. This enables dedup detection even for files we can't read.
 
-**For `ndex verify`:** Recomputes BLAKE3 for selected files and compares against stored hashes. This detects silent data corruption (bitrot). It reads the file fresh from disk, so it catches any corruption that happened after initial indexing.
-
-### 5.4 Hash Cache File
-
-The mmap'd hash cache enables the reconciler to check "has the content of this file changed?" without querying SQLite, for cases where metadata (mtime/size) comparison is ambiguous (e.g., a file was modified but `mtime` was preserved via `touch -r`).
-
-```
-hashes.bin:
-
-Header (64 bytes):
-  magic:       [u8; 8]   = b"NDEXHSH\0"
-  version:     u32        = 1
-  entry_count: u64
-  flags:       u32        = bit 0: sorted
-  _reserved:   [u8; 40]
-
-Entry (40 bytes each, sorted by file_id for binary search):
-  file_id: u64
-  blake3:  [u8; 32]
-
-At 10M files:  400 MB mmap'd
-At 50M files:  2.0 GB mmap'd
-At 100M files: 4.0 GB mmap'd (only accessed pages resident)
-```
-
-The cache is rebuilt from `manifest.db` if it becomes corrupt or is deleted. It's a pure acceleration structure, not a source of truth.
+BLAKE3 hashes are stored in the `blake3` column of the `files` table in `manifest.db`. For `ndex verify`, hashes are read from the manifest and compared against freshly computed hashes.
 
 ### 5.5 Chunking Strategy
 
@@ -286,7 +262,7 @@ max_file_size = "2GiB"
 
 [identity]
 schema_version = 3                  # bumped on any breaking index format change
-created_by = "ndex-remote 0.4.0"    # version that created this index
+created_by = "ndex-remote 0.1.0"    # version that created this index
 created_at = "2026-03-17T08:00:00Z"
 
 [embedding]
@@ -458,7 +434,7 @@ The server admin runs this once:
 curl -fsSL https://get.ndex.dev/install.sh | sh
 
 # Or with explicit version/architecture:
-curl -fsSL https://get.ndex.dev/install.sh | sh -s -- --version 0.4.0 --arch x86_64
+curl -fsSL https://get.ndex.dev/install.sh | sh -s -- --version 0.1.0 --arch x86_64
 
 # Installs to ~/.local/bin/ndex-remote by default
 # Or /usr/local/bin/ndex-remote with --system
@@ -491,8 +467,8 @@ yay -S ndex-remote-bin
 **Method 3: Manual tarball**
 
 ```bash
-wget https://github.com/.../ndex-remote-v0.4.0-linux-x86_64.tar.gz
-tar xzf ndex-remote-v0.4.0-linux-x86_64.tar.gz
+wget https://github.com/.../ndex-remote-v0.1.0-linux-x86_64.tar.gz
+tar xzf ndex-remote-v0.1.0-linux-x86_64.tar.gz
 cp ndex-remote ~/.local/bin/
 ```
 
@@ -503,7 +479,7 @@ cp ndex-remote ~/.local/bin/
 ```bash
 # On the server:
 ndex-remote self-update                    # update to latest
-ndex-remote self-update --version 0.5.0    # specific version
+ndex-remote self-update --version 0.1.0    # specific version
 ndex-remote self-update --check            # just check, don't install
 ```
 
@@ -518,7 +494,7 @@ Self-update process:
 The **client** can detect an outdated remote and suggest an upgrade:
 
 ```
-Warning: ndex-remote on 'nas' is version 0.3.2, but your client is 0.5.0.
+Warning: ndex-remote on 'nas' is version 0.0.9, but your client is 0.1.0.
 Some features may be unavailable. To upgrade on the server, run:
 
     ssh nas "ndex-remote self-update"
@@ -535,7 +511,7 @@ $ ndex-remote index /pool/archive
 
   Embedding model 'snowflake-arctic-embed-m-v2.0' not found.
   Downloading to ~/.ndex/models/snowflake-arctic-embed-m-v2.0/...
-  ████████████████████████████░░░░ 230 MB / 297 MB  [15s ETA]
+  ████████████████████████████░░░░ 100 MB / 130 MB  [3s ETA]
 
   Model verified (blake3: a3f2e8...). Ready.
 
@@ -566,7 +542,7 @@ ndex-remote model path arctic                # print the path to the model file
 ```
 ~/.ndex/models/
 ├── snowflake-arctic-embed-m-v2.0/
-│   ├── model.onnx          (297 MB, INT8)
+│   ├── model.onnx          (~130 MB, INT8)
 │   ├── tokenizer.json      (600 KB)
 │   └── manifest.json       (model metadata, expected hashes)
 └── granite-embedding-small-english-r2/
@@ -579,8 +555,12 @@ ndex-remote model path arctic                # print the path to the model file
 
 | Shortname | Full name | Size (ONNX INT8) | Dims | MRL | Languages | BEIR/MIRACL |
 |---|---|---|---|---|---|---|
-| `arctic` (default) | snowflake-arctic-embed-m-v2.0 | ~297 MB | 768 | yes (256d) | 74 languages | MIRACL 55.2 |
+| `arctic` (default) | snowflake-arctic-embed-m-v2.0 | ~130 MB | 768 | yes (256d) | 74 languages | MIRACL 55.2 |
 | `granite-small` | granite-embedding-small-english-r2 | ~48 MB | 384 | no | English only | BEIR 55.6 |
+
+> **ONNX model sourcing:** ndex downloads pre-built ONNX INT8 models from the ndex GitHub releases (not HuggingFace directly). The release pipeline exports and quantizes models using `optimum-cli`, verifies output dimensions and MRL truncation correctness, and publishes the artifacts alongside each ndex release. This ensures reproducibility and avoids dependency on third-party ONNX exports.
+
+> **Note:** Version numbers in examples (0.1.0) reflect the v0.1 milestone. The PRD document version (0.3.0-draft) tracks the document revision, not the software release.
 
 **Offline/air-gapped servers:** For servers with no internet access, models can be pre-staged:
 
@@ -830,7 +810,7 @@ Split on '/' and '.' → LowerCaser → also emit trigrams per component
 
 CJK: `LinderaTokenizer` (Japanese), `CangJieTokenizer` (Chinese), auto-detected per chunk.
 
-**Threading:** Tantivy's `IndexWriter` is thread-safe. Multiple extraction workers call `add_document()` concurrently. Tantivy internally buffers documents per-thread and flushes to segments. Background merging keeps segment count bounded. Search readers are also concurrent (lock-free segment traversal).
+**Threading:** Tantivy's `IndexWriter` uses a single writer with internal per-thread document buffers. Multiple extraction workers prepare documents and call `add_document()` concurrently — Tantivy handles the internal synchronization. Only one `IndexWriter` instance should exist per index. Search readers (`IndexReader`) are fully concurrent and lock-free.
 
 ### 11.3 Semantic Vector Index — `vectors/` (USearch)
 
@@ -866,7 +846,18 @@ struct SidecarEntry {      // 24 bytes (4 bytes padding after chunk_ord for alig
 }
 ```
 
-**Threading:** USearch reads are lock-free (concurrent HNSW traversal). Writes go through a single writer thread. The sidecar is append-only during indexing, mmap'd read-only during search.
+**Why USearch:** USearch is the only actively maintained Rust-compatible ANN library with native f16 SIMD support, mmap-based serving (`view()` API), concurrent lock-free reads, and filter predicates. Alternatives (hnswlib Rust bindings, hora, annoy-rs) are abandoned since 2021 and lack required features.
+
+**Crash safety:** USearch `save()` is not atomic. ndex uses save-to-temp-then-rename:
+```rust
+index.save("vectors/index.usearch.tmp")?;
+std::fs::rename("vectors/index.usearch.tmp", "vectors/index.usearch")?;
+```
+`rename()` is atomic on POSIX filesystems (including ZFS). If the process crashes mid-save, only the `.tmp` file is corrupted; the previous `index.usearch` remains valid. On startup, stale `.tmp` files are deleted.
+
+The sidecar (`sidecar.bin`) uses the same save-to-temp-then-rename pattern.
+
+**Threading:** USearch `view()`-based readers are lock-free and `Send + Sync` (concurrent HNSW traversal over mmap'd data). Writes go through a single `Index` instance with per-node bit-level locks — thread-safe for concurrent `add()` calls, but ndex uses a single writer thread for simplicity and to coordinate with the sidecar append.
 
 ### 11.4 Metadata Index — `meta.db` (SQLite)
 
@@ -875,7 +866,10 @@ Same pragmas as manifest.
 ```sql
 -- doc_meta: extracted document metadata
 CREATE TABLE doc_meta (
-    file_id     INTEGER PRIMARY KEY REFERENCES files(file_id),
+    -- file_id references manifest.db:files(file_id) by convention.
+    -- Cross-database foreign keys are not enforced by SQLite.
+    -- Orphan cleanup is handled by ndex compact.
+    file_id     INTEGER PRIMARY KEY,
     title       TEXT,
     author      TEXT,
     subject     TEXT,
@@ -890,7 +884,10 @@ CREATE TABLE doc_meta (
 
 -- media_meta: image/video/audio metadata
 CREATE TABLE media_meta (
-    file_id       INTEGER PRIMARY KEY REFERENCES files(file_id),
+    -- file_id references manifest.db:files(file_id) by convention.
+    -- Cross-database foreign keys are not enforced by SQLite.
+    -- Orphan cleanup is handled by ndex compact.
+    file_id       INTEGER PRIMARY KEY,
     width         INTEGER,
     height        INTEGER,
     duration_ms   INTEGER,
@@ -918,38 +915,28 @@ CREATE TABLE tags (
 );
 
 CREATE TABLE file_tags (
-    file_id  INTEGER NOT NULL REFERENCES files(file_id),
+    -- file_id references manifest.db:files(file_id) by convention.
+    -- Cross-database foreign keys are not enforced by SQLite.
+    -- Orphan cleanup is handled by ndex compact.
+    file_id  INTEGER NOT NULL,
     tag_id   INTEGER NOT NULL REFERENCES tags(tag_id),
     PRIMARY KEY (file_id, tag_id)
 ) WITHOUT ROWID;
 
--- entities: named entity recognition results (v0.2, schema reserved)
-CREATE TABLE entities (
-    entity_id  INTEGER PRIMARY KEY,
-    file_id    INTEGER NOT NULL REFERENCES files(file_id),
-    kind       TEXT NOT NULL,     -- 'person', 'org', 'location', 'date', etc.
-    value      TEXT NOT NULL,
-    chunk_ord  INTEGER,
-    confidence REAL
-);
-CREATE INDEX idx_entities_file ON entities(file_id);
-CREATE INDEX idx_entities_kind_value ON entities(kind, value);
+-- NER entities table: deferred to v0.2. Schema will be defined when NER is implemented.
+-- Adding it will require a schema version bump and reindex (per §6 no-migration policy).
 ```
 
 ### 11.5 Thumbnail Store — `thumbs/`
 
 ```
-thumbs/{file_id_hex[0:2]}/{file_id}.sm.webp   (150x150 max)
-thumbs/{file_id_hex[0:2]}/{file_id}.md.webp   (600x600 max)
+thumbs/{blake3_hex[0:2]}/{file_id}.sm.webp   (150x150 max)
+thumbs/{blake3_hex[0:2]}/{file_id}.md.webp   (600x600 max)
 ```
 
-256 shards by first byte of file_id.
+256 shards by first byte of the file's BLAKE3 hash, which is uniformly distributed. The filename uses `file_id` for uniqueness.
 
-### 11.6 Hash Cache — `hashes.bin`
-
-BLAKE3 hash cache, mmap'd, sorted by file_id. (Detailed in §5.4.)
-
-### 11.7 On-Disk Layout
+### 11.6 On-Disk Layout
 
 ```
 /pool/archive/.ndex/
@@ -959,7 +946,6 @@ BLAKE3 hash cache, mmap'd, sorted by file_id. (Detailed in §5.4.)
 ├── manifest.db         (SQLite WAL)
 ├── manifest.db-wal
 ├── manifest.db-shm
-├── hashes.bin          (mmap'd BLAKE3, 40 bytes/entry)
 ├── content/            (tantivy)
 │   ├── meta.json
 │   ├── .managed.json
@@ -1012,6 +998,16 @@ Produces `DashMap<PathBuf, WalkEntry>` where `WalkEntry = { size, mtime_ns, ctim
 
 > **Memory requirements:** Phase 1 walk and Phase 2 diff hold all file metadata in memory. Estimated ~200 bytes per file entry (path + metadata). At 10M files: ~2 GB RAM. At 50M files: ~10 GB RAM. Systems indexing 50M+ files should have at least 16 GB RAM available for ndex-remote. A streaming/disk-backed approach for very large file counts is deferred to v0.3.
 
+> **Hard limit:** `ndex-remote` checks available system memory before Phase 1. If estimated memory for the walk (file_count_estimate × 200 bytes) exceeds 75% of available RAM, it aborts with a clear error:
+> ```
+> Error: Estimated 10.2 GB RAM needed for 51M files, but only 7.8 GB available.
+> Options:
+>   - Index a subdirectory: ndex index /pool/archive/docs
+>   - Increase system RAM
+>   - Wait for streaming reconciliation (planned for v0.3)
+> ```
+> The file count estimate comes from the manifest (for re-index) or a quick `stat()` on the root inode's link count (for first index). This is best-effort — the walk may still OOM if the estimate is wrong, but it catches the common case.
+
 **Phase 2: Diff** — compare walk results against manifest.
 
 Load manifest into `HashMap<u64 /* path_hash */, Vec<FileRecord>>`. For each walked file, compute `path_hash`, look up, compare `(size, mtime_ns)`:
@@ -1022,6 +1018,8 @@ Load manifest into `HashMap<u64 /* path_hash */, Vec<FileRecord>>`. For each wal
 - Manifest entries not in walk → `deleted` (set `status = 3`)
 
 Phase 2 is parallelized via `rayon::par_iter()` over walk results. The manifest hashmap is read-only and shared.
+
+> Note: xxh3_64 collisions are extremely rare (birthday probability ~0.007% at 50M files), so the `Vec<FileRecord>` per path_hash bucket is almost always length 1. The `Vec` exists for correctness — on collision, the `AND path = ?` check disambiguates. An alternative is `HashMap<u64, FileRecord>` with a separate collision map, but the `Vec` approach is simpler and the overhead is negligible.
 
 **Phase 3: Process** — extract, hash, chunk, embed, index.
 
@@ -1049,6 +1047,19 @@ Crash recovery: resume from `status = 0` files, re-process missing indices per `
 ### 12.3 Concurrency
 
 `flock()` on `.ndex/lock` for write exclusion. Multiple readers (search sessions) run concurrently — SQLite WAL, tantivy readers, and USearch mmap reads all support concurrent access. Readers never block on a writer (WAL mode — readers see the last committed state).
+
+### 12.4 Symlink Handling
+
+**Policy:** ndex follows symlinks by default, matching `find -L` behavior. Symlink cycles are detected by tracking `(dev, inode)` pairs during the walk; a cycle is logged as a warning and the symlink target is skipped.
+
+Symlinks pointing outside the index root are **not followed** — the index only covers files under the root path. This prevents a symlink at `/pool/archive/link → /etc` from pulling in system files.
+
+```toml
+[walk]
+follow_symlinks = true       # default: true
+```
+
+Set `follow_symlinks = false` to index only regular files and skip all symlinks.
 
 ---
 
@@ -1106,9 +1117,11 @@ struct HandshakeResp {
 
 ### 13.4 Message Types
 
+> **Serialization:** Always use `rmp_serde::to_vec_named()` / `rmp_serde::from_slice()`. The `_named` variant serializes field names as strings (required for tagged enum deserialization). Internally tagged enums (`#[serde(tag = "kind")]` without `content`) have known issues in `rmp-serde` and must not be used.
+
 ```rust
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", content = "data")]
 enum ClientMessage {
     Handshake(HandshakeReq),
     SearchRequest {
@@ -1131,7 +1144,7 @@ enum ClientMessage {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", content = "data")]
 enum ServerMessage {
     Handshake(HandshakeResp),
     SearchResult {
@@ -1206,6 +1219,7 @@ COMMANDS:
     stats       Index statistics
     tag         Manage tags
     verify      Verify file integrity
+    delete      Remove files from the index
     dedup       Find duplicate files
     compact     Optimize index storage
     reindex     Rebuild index from scratch
@@ -1245,6 +1259,7 @@ OUTPUT:
     --no-score              Omit scores
     --count                 Print result count only
     --explain               Show scoring breakdown
+    --fail-no-results       Exit with code 7 if no results (useful for scripting)
 
 REFRESH:
     --no-refresh            Skip auto-refresh, search stale index
@@ -1289,7 +1304,7 @@ ndex index [HOST:]<PATH> [OPTIONS]
 ndex init <PATH> [OPTIONS]
 
     --model <MODEL>     multilingual (default) | english-only | none
-                        multilingual = snowflake-arctic-embed-m-v2.0 (297 MB, 74 langs)
+                        multilingual = snowflake-arctic-embed-m-v2.0 (~130 MB, 74 langs)
                         english-only = granite-embedding-small-english-r2 (48 MB, EN)
     --exclude <PAT>     Gitignore-style exclude (repeatable)
     --no-fts            Disable full-text index
@@ -1442,6 +1457,50 @@ remote_path = "/usr/local/bin/ndex-remote"
 default_root = "/pool/archive"
 
 # Shorthand: ndex search nas: "query"
+```
+
+**Client global config** (`~/.config/ndex/config.toml`):
+
+```toml
+[display]
+color = "auto"        # auto | always | never
+hyperlinks = "auto"   # auto | always | never
+format = "pretty"     # default output format
+
+[ssh]
+default_key = "~/.ssh/id_ed25519"
+default_user = ""     # empty = $USER
+```
+
+CLI flags and env vars override config file values. Per-host settings in `hosts.toml` override global settings.
+
+### 14.8 `ndex delete`
+
+```
+ndex delete [HOST:]<PATH> <GLOB> [OPTIONS]
+    Remove matching files from all indices (manifest, FTS, vectors, meta, thumbs).
+    --dry-run           Show what would be deleted
+    --confirm           Skip interactive confirmation
+
+    Example: ndex delete /pool "secrets/**/*.key"
+```
+
+This sets `status=3` in the manifest and removes entries from FTS, vectors, meta, and thumbs. The files on disk are not touched.
+
+### 14.9 `ndex compact`
+
+```
+ndex compact [HOST:]<PATH> [OPTIONS]
+    Optimize index storage by reclaiming space from deleted/updated entries.
+
+    Performs:
+    - SQLite VACUUM on manifest.db and meta.db
+    - Tantivy segment merge (reduces segment count, reclaims deleted docs)
+    - USearch rebuild (removes tombstoned vectors, re-optimizes HNSW graph)
+    - Thumbnail cleanup (removes orphaned thumbs for deleted files)
+
+    --dry-run           Show estimated space savings
+    --only <INDEX>      Compact specific index: manifest | fts | vectors | meta | thumbs
 ```
 
 ---
