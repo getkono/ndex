@@ -1,8 +1,8 @@
 # PRD: `ndex` — Deep File Indexer for Archival Storage
 
 **Version:** 0.3.0-draft
-**Date:** 2026-03-29
-**Status:** Draft (pre-implementation amendments applied 2026-03-23; format coverage amendments applied 2026-03-29)
+**Date:** 2026-03-30
+**Status:** Draft (pre-implementation amendments applied 2026-03-23; format coverage amendments applied 2026-03-29; additional format coverage amendments applied 2026-03-30)
 
 ---
 
@@ -149,6 +149,8 @@ BLAKE3 hashes are stored in the `blake3` column of the `files` table in `manifes
 
 > **tree-sitter language detection:** Language selection for the code extractor follows three steps: (1) **Extension lookup** — a static table maps extensions to tree-sitter grammars (`.rs`→Rust, `.py`→Python, `.js`→JavaScript, `.ts`→TypeScript, `.c`/`.h`→C, `.cpp`/`.cxx`/`.hpp`→C++, etc.). (2) **Shebang detection** — if no extension match and the first line starts with `#!`, the interpreter name is parsed (e.g., `#!/usr/bin/env python3` → Python). (3) **Plaintext fallback** — if no grammar is available for the detected language, the file falls through to the plaintext extractor, logged at `DEBUG` level. Ambiguous cases in v0.1: `.h` → C (not C++), `.m` → Objective-C. These are pragmatic defaults for archive workloads where C is more prevalent.
 
+> **v0.1 grammar set:** The following tree-sitter grammars are bundled: Rust, Python, JavaScript, TypeScript, TSX, C, C++, Go, Java, Ruby, PHP, C#, Swift, Kotlin, Scala, Lua, Bash/Shell, Haskell, Elixir, Erlang, OCaml, R, TOML, YAML, JSON, HTML, CSS, SQL, Dockerfile, Makefile, Protobuf, HCL (Terraform). Languages without a bundled grammar (Perl, Dart, Zig, Nim, etc.) fall through to the plaintext extractor. The grammar set is compiled into the `ndex-remote` binary — adding new grammars requires a release.
+
 ### 4.5 Chunking Strategy
 
 **Strategy: Recursive structure-aware splitting**
@@ -177,9 +179,15 @@ BLAKE3 hashes are stored in the `blake3` column of the `files` table in `manifes
 | Code | `tree-sitter` | Functions, classes, modules |
 | Plaintext | Recursive splitter | `\n\n` > `\n` > `. ` > ` ` |
 | Logs | Line-based | Timestamp patterns, fixed line batches |
-| CSV | Record-based | Row boundaries; header propagation; delimiter auto-detected (`,` vs `\t`); quoted newlines handled |
+| CSV/TSV | Record-based | Row boundaries; header propagation; delimiter auto-detected (`,`, `\t`, `;`, `|`) via first-line heuristic; `.tsv` and `text/tab-separated-values` routed to same extractor; quoted newlines handled |
 | JSON | Record-based | Variant-aware: single object → split at top-level keys; JSON array → split at element boundaries; NDJSON → split at line boundaries |
 | SQL | Statement-based | `;` delimiters |
+
+> **Code structure signals:** The tree-sitter code extractor uses AST node types as chunk boundaries. Top-level declarations (functions, methods, classes, struct/enum definitions, impl blocks, module declarations) are treated as section-level boundaries (priority 1 in the boundary hierarchy). Within a function body, statement boundaries serve as paragraph-level boundaries. The function/class/module name is propagated as heading context (like `heading_prefix` for document headings), so a chunk from inside `fn process_file()` is prefixed with `process_file` for better search relevance.
+
+> **Log file detection:** Files are routed to the log chunker when: (1) the extension is `.log`, or (2) the MIME type is `text/plain` and the first 10 lines match a common log timestamp pattern (ISO 8601, syslog `MMM DD HH:MM:SS`, Apache/nginx combined log format, or `YYYY-MM-DD HH:MM:SS.mmm`). If no timestamp pattern is detected, the file falls through to the plaintext splitter. Files with extensions `.out` and `.err` are not auto-detected as logs — they use the plaintext path unless timestamp patterns are found.
+
+> **Markdown frontmatter:** YAML frontmatter (delimited by `---`) and TOML frontmatter (delimited by `+++`) in Markdown files is parsed by `pulldown-cmark` as raw text. In v0.1, frontmatter fields (`title`, `author`, `date`, etc.) are **not** extracted into `doc_meta` — they are indexed as regular text content within the first chunk. Structured frontmatter extraction into `doc_meta` is deferred to v0.2.
 
 **Normalized block types:** `Heading(level)`, `Paragraph`, `CodeBlock(lang)`, `ListItem`, `Table`, `Quote`, `Raw`
 
@@ -208,9 +216,14 @@ heading_prefix = true   # prepend section heading to each chunk
 - Rationale: PDF extractors and some format parsers may buffer entire file; the cap prevents OOM (see config reference in §17)
 
 **Media files (image/\*, video/\*, audio/\*):**
-- Metadata-only in v0.1: image EXIF metadata via the `kamadak-exif` crate (pure-Rust, no native dependencies)
-- Video and audio metadata extraction (codec info, duration, resolution via ffprobe or similar) is deferred to v0.2
-- No transcription/OCR in v0.1 (deferred to v0.3)
+- **Images:** EXIF metadata extraction in v0.1 (see §4.8 EXIF matrix). `status=1`.
+- **Video** (MP4, MKV, AVI, MOV, WebM, FLV, WMV, MPEG, etc.): `status=1` (indexed) with a `media_meta` row containing all fields NULL. No metadata extraction in v0.1 — codec, duration, resolution, bitrate require `ffprobe` or a dedicated parser (deferred to v0.2). The file is searchable by path, filename, size, and mtime.
+- **Audio** (MP3, FLAC, WAV, AAC, OGG, M4A, WMA, AIFF, OPUS, etc.): Same as video — `status=1`, `media_meta` row with all fields NULL. ID3/Vorbis tag extraction (artist, album, title, track) deferred to v0.2.
+- No transcription/OCR in v0.1 (deferred to v0.3).
+
+> **Rationale for `status=1` not `status=5`:** Video and audio files are valid indexed entries — they appear in path searches, `ndex info`, and `ndex stats`. Marking them `status=5` (skipped) would imply they are excluded from the index entirely. `status=1` with empty metadata accurately reflects "indexed, no content extracted yet."
+
+> **Sparse files:** On filesystems that support sparse files (ZFS, ext4, XFS), the file's logical size (from `stat()`) may greatly exceed its physical size on disk. The `max_file_size` check uses the logical size, so a 100 GiB sparse file with 1 MiB actual data is correctly skipped. For sparse files under `max_file_size`, `std::fs::read()` reads the full logical size (holes become zero bytes). This is wasteful but correct. mmap (`memmap2`) handles sparse files more efficiently (zero-page holes are not physically read). The mmap threshold (files above which mmap is used instead of `read()`) is 64 MiB — most sparse files encountered in practice exceed this threshold.
 
 **Archives (zip, tar, gz, 7z, rar):**
 - Metadata-only in v0.1 (file count, total size, listing)
@@ -290,6 +303,10 @@ The rationale for not treating these as plaintext: OOXML XML internals (shared-s
 
 XML files (`.xml`, `application/xml`, `text/xml`) are handled by the HTML extractor path (`lol-html` / `scraper`). lol-html's lenient tag handling produces acceptable results for well-formed XML. For severely malformed XML that `lol-html` cannot parse, the plaintext fallback applies. A dedicated XML extractor is not warranted in v0.1 given the diversity of XML dialects.
 
+#### SVG
+
+SVG files (`image/svg+xml`, detected by magic bytes `<svg` or `<?xml` with SVG namespace) are routed to the **HTML/XML text extraction path**, not the image EXIF path. Rationale: SVG files contain searchable text content (`<text>`, `<title>`, `<desc>` elements, labels, annotations) that is valuable for full-text search. Pixel dimensions (`width`/`height` attributes) are extracted into `media_meta` if present, but no `doc_meta` row is created. EXIF does not apply to SVG.
+
 #### Config and Markup Formats (Plaintext Path)
 
 The following formats are treated as plaintext (recursive `\n\n` splitter, §4.5). They are not listed in the §4.5 extraction table because their handling is identical to plain text — no per-format structure signals are used.
@@ -302,6 +319,18 @@ The following formats are treated as plaintext (recursive `\n\n` splitter, §4.5
 | `.rst` (reStructuredText) | `text/x-rst` | Heading underline markers (`===`, `---`) act as paragraph boundaries |
 | `.adoc`, `.asciidoc` (AsciiDoc) | `text/asciidoc` | Treated as plaintext |
 | `.tex` (LaTeX) | `application/x-tex` | Treated as plaintext; TeX commands appear as-is in indexed text |
+
+#### Extensionless and Dotfile Text Detection
+
+Files that `infer` (magic bytes) and `mime_guess` (extension) both fail to identify — including extensionless files (`Makefile`, `Dockerfile`, `Vagrantfile`, `Procfile`, `Jenkinsfile`, `Gemfile`, `Rakefile`, `CMakeLists.txt`) and dotfiles (`.bashrc`, `.zshrc`, `.gitconfig`, `.editorconfig`, `.dockerignore`, `.eslintrc`, `.prettierrc`) — undergo a **text-or-binary heuristic** before being classified as `application/octet-stream`:
+
+1. Read the first 8192 bytes of the file.
+2. If the buffer contains a **null byte** (`\x00`), classify as binary → `application/octet-stream` → `status=5` (skipped).
+3. If no null byte is found, classify as `text/plain` → route to the plaintext extractor.
+
+This heuristic matches Git's text/binary detection and ensures common extensionless text files are indexed rather than silently skipped. The heuristic runs **after** MIME detection fails, not as a replacement — files with recognized MIME types bypass this check entirely.
+
+> **Known file table (static):** As an optimization, a hardcoded table maps common extensionless filenames to MIME types: `Makefile` → `text/x-makefile`, `Dockerfile` → `text/x-dockerfile`, `CMakeLists.txt` → `text/x-cmake`. These are routed to the plaintext extractor (or tree-sitter if a grammar exists). The table is small (~20 entries) and not user-configurable in v0.1.
 
 #### JSON Variants
 
@@ -338,8 +367,17 @@ Single-file decompression and inner-file indexing deferred to v0.2.
 | WebP | Partial | WebP with EXIF segment: full fields. Lossless WebP (VP8L) with no EXIF segment: `width`, `height` only |
 | PNG | None (PNG uses tEXt/iTXt chunks, not EXIF) | `width`, `height` only; all EXIF fields NULL |
 | GIF | None | `width`, `height` only; all EXIF fields NULL |
+| BMP | None | `width`, `height` only via `image` crate; all EXIF fields NULL |
+| CR2 (Canon Raw) | Full via TIFF-based container | All EXIF fields (camera, GPS, taken_at, ISO, aperture, focal_length, shutter_speed) |
+| NEF (Nikon Raw) | Full via TIFF-based container | Same as CR2 |
+| ARW (Sony Raw) | Full via TIFF-based container | Same as CR2 |
+| DNG (Adobe Raw) | Full (TIFF-based, standardized) | Same as CR2 |
+| ORF (Olympus Raw) | Partial — `kamadak-exif` best-effort | Core EXIF fields; some proprietary MakerNote tags may be missing |
+| RW2 (Panasonic Raw) | Partial — `kamadak-exif` best-effort | Same as ORF |
 
-For PNG and GIF, a `media_meta` row is still inserted with `width` and `height` populated. NULL EXIF fields are not an error — these formats simply do not carry EXIF.
+For PNG, GIF, and BMP, a `media_meta` row is still inserted with `width` and `height` populated. NULL EXIF fields are not an error — these formats simply do not carry EXIF.
+
+> **Raw format note:** Most raw camera formats (CR2, NEF, ARW, DNG) use TIFF-based containers, and `kamadak-exif` parses them via its TIFF reader. Proprietary MakerNote tags (camera-specific extensions) are not decoded — only standard EXIF/TIFF tags are extracted. This covers all fields in the `media_meta` table. Formats with non-TIFF containers (ORF, RW2) have best-effort support; if `kamadak-exif` fails to parse, `width`/`height` are populated via the `image` crate and EXIF fields are NULL.
 
 > **PNG tEXt/iTXt metadata** (e.g., `Author`, `Comment`, `Creation Time`): not extracted in v0.1. Deferred to v0.2.
 
@@ -380,6 +418,24 @@ Files that produce fewer than `min_tokens` (default: 32) tokens after extraction
 - `min_tokens` is the minimum size for the *splitter* — it does not gate whether a file is indexed. A 5-token file produces one 5-token chunk and is fully indexed.
 - `status=1` (indexed).
 
+#### Text Encoding and BOM Handling
+
+ndex assumes UTF-8 for all text content. Non-UTF-8 files are handled with detection-and-transcode:
+
+1. **BOM detection (first pass):** If the file starts with a BOM (UTF-8 `\xEF\xBB\xBF`, UTF-16LE `\xFF\xFE`, UTF-16BE `\xFE\xFF`), the BOM determines the encoding. The BOM bytes are stripped before extraction. UTF-16 content is transcoded to UTF-8 via the `encoding_rs` crate.
+
+2. **Encoding detection (second pass, if no BOM):** If the byte buffer is not valid UTF-8 (`std::str::from_utf8()` fails), ndex uses the `chardetng` crate (Mozilla's encoding detector, same algorithm as Firefox) to guess the encoding. If confidence is sufficient, the content is transcoded to UTF-8 via `encoding_rs`. If detection fails or confidence is too low, lossy UTF-8 conversion is applied (`String::from_utf8_lossy()`), replacing invalid sequences with U+FFFD.
+
+3. **HTML charset override:** For HTML files, if a `<meta charset="...">` or `<meta http-equiv="Content-Type" content="...; charset=...">` tag specifies an encoding, that encoding takes precedence over `chardetng` detection. Parsed by `lol-html` before full extraction.
+
+4. **Logging:** Transcoded files are logged at `DEBUG` level: `"Transcoded <path> from <encoding> to UTF-8"`. Lossy conversions (U+FFFD replacements) are logged at `WARN` level.
+
+**Library:** `chardetng` (Mozilla, same algorithm as Firefox) for detection; `encoding_rs` (Mozilla, same as Firefox/Chromium) for transcoding. Both are pure-Rust, no native dependencies.
+
+#### Jupyter Notebooks
+
+> **Jupyter Notebooks (`.ipynb`):** Detected as `application/json`. The JSON extractor handles them, but results are noisy — base64-encoded cell outputs, execution counts, and cell metadata are indexed alongside code and markdown content. A dedicated `.ipynb` extractor (extracting only code cells and markdown cells, stripping outputs and metadata) is deferred to v0.2.
+
 #### Deferred Formats
 
 | Format | Deferred to | Notes |
@@ -392,6 +448,8 @@ Files that produce fewer than `min_tokens` (default: 32) tokens after extraction
 | XLSX text extraction | v0.2 | Metadata-only in v0.1 (see OOXML above) |
 | PPTX text extraction | v0.2 | Metadata-only in v0.1 (see OOXML above) |
 
+> **v0.1 behavior for deferred formats:** When a file matches a deferred format (RTF, EPUB, EML, MBOX, MSG, ODS, ODT, ODP), it is classified as `status=4` (failed_permanent) with `error_msg`: `"Format '<mime_type>' extraction not yet supported. Planned for <version>."` The file is indexed by path and filesystem metadata only. This differs from `status=5` (skipped) which implies the file was intentionally excluded (e.g., over size limit). `status=4` signals that extraction will be available in a future version.
+
 #### Explicitly Out-of-Scope
 
 The following formats produce `status=4` (unsupported format) or archive/binary skip. They are not on any current roadmap:
@@ -400,6 +458,7 @@ The following formats produce `status=4` (unsupported format) or archive/binary 
 - DWG / DXF (CAD files)
 - Proprietary creative-tool formats (`.psd`, `.ai`, `.sketch`, `.fig`) — indexed by path/metadata only
 - `.db`, `.sqlite` database files — not content-indexed (binary format; SQL dumps as `.sql` are indexed normally)
+- Font files (`.ttf`, `.otf`, `.woff`, `.woff2`, `.eot`) — binary format with no searchable text content; indexed by path/metadata only, `status=5` (skipped)
 
 ---
 
@@ -967,6 +1026,13 @@ CREATE TABLE file_tags (
 -- Adding it will require a schema version bump and reindex (per §5 no-migration policy).
 ```
 
+> **doc_meta population:**
+> - **PDF:** `pdf_oxide` extracts the PDF Info dictionary (Title, Author, Subject, Creator, Producer, CreationDate, ModDate). Page count is derived from the page tree. If `pdf_oxide` fails and `pdfium` fallback is used, `pdfium` provides the same metadata via its document info API.
+> - **DOCX:** `docx-rust` reads `docProps/core.xml` (Dublin Core: title, creator, subject, language, created/modified dates) and `docProps/app.xml` (page count, word count, application name). If properties XML is missing or malformed, fields are NULL.
+> - **HTML:** `<title>` → `title`, `<meta name="author">` → `author`, `<meta name="description">` → `subject`. Other fields NULL.
+> - **Markdown:** `title` is set to the first `# heading` if present. Other fields NULL (or populated from frontmatter in v0.2).
+> - **All other formats:** `doc_meta` row is not created for plaintext, code, CSV, JSON, SQL, log, config formats. These have no structured document metadata.
+
 ### 10.5 Thumbnail Store — `thumbs/`
 
 Deferred to v0.2.
@@ -1065,6 +1131,17 @@ Ignore hierarchy (evaluated in order, first match wins):
 
 Rationale: Archives often contain `.gitignore` files from checked-out repos. Respecting them avoids indexing `node_modules/`, `target/`, `.venv/`, build artifacts, etc. — which is almost always the desired behavior. (see config reference in §17)
 
+> **Sensitive file patterns:** ndex does not have a built-in sensitive-file exclusion list. Files like `.env`, `credentials.json`, `id_rsa`, `*.pem` are indexed if not excluded by `.gitignore` or `.ndexignore`. Users managing archives with sensitive files should add patterns to `.ndexignore`:
+> ```
+> # .ndexignore
+> .env*
+> *.pem
+> *.key
+> **/credentials.json
+> **/secrets/**
+> ```
+> ndex logs a `WARN` at the end of indexing if any indexed files match a hardcoded sensitive-file heuristic (filenames containing `secret`, `credential`, `password`, `private_key`, or extensions `.pem`, `.key`, `.p12`, `.pfx`): `"Warning: 3 potentially sensitive files were indexed. Review with: ndex search /pool --path '*.pem' --path '*.key'"`. This is advisory only — the files are still indexed.
+
 **Phase 1: Walk** — parallel filesystem traversal via `ignore` crate.
 
 ```rust
@@ -1079,6 +1156,8 @@ let walker = WalkBuilder::new(root)
 If `ignore.respect_gitignore = false` in config, pass `.git_ignore(false)`.
 
 Produces `DashMap<PathBuf, WalkEntry>` where `WalkEntry = { size, mtime_ns, ctime_ns, inode, dev, mode }`.
+
+> **Non-regular files:** The Phase 1 walker skips non-regular files: FIFOs (named pipes), Unix domain sockets, block/character device files, and broken symlinks (symlinks whose target does not exist). These are silently excluded — no manifest entry is created, no warning is logged (these are expected filesystem entries, not errors). Only regular files and followed symlinks to regular files are indexed. The `ignore` crate's `WalkBuilder` handles this via `file_type()` filtering.
 
 > **Memory requirements:** Phase 1 walk builds a `DashMap` of all file metadata (~270 bytes/file). Phase 2 diff loads the manifest into a second `HashMap` (~200 bytes/file). Total: ~470 bytes/file across both phases simultaneously. At 10M files: ~5 GB RAM. At 50M files: ~25 GB RAM. Systems indexing 50M+ files should have at least 32 GB RAM available for ndex-remote.
 >
