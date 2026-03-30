@@ -2,7 +2,7 @@
 
 **Version:** 0.3.0-draft
 **Date:** 2026-03-30
-**Status:** Draft (pre-implementation amendments applied 2026-03-23; format coverage amendments applied 2026-03-29; additional format coverage amendments applied 2026-03-30)
+**Status:** Draft (pre-implementation amendments applied 2026-03-23; format coverage amendments applied 2026-03-29; additional format coverage amendments applied 2026-03-30; implementation-readiness amendments applied 2026-03-30)
 
 ---
 
@@ -226,9 +226,47 @@ heading_prefix = true   # prepend section heading to each chunk
 > **Sparse files:** On filesystems that support sparse files (ZFS, ext4, XFS), the file's logical size (from `stat()`) may greatly exceed its physical size on disk. The `max_file_size` check uses the logical size, so a 100 GiB sparse file with 1 MiB actual data is correctly skipped. For sparse files under `max_file_size`, `std::fs::read()` reads the full logical size (holes become zero bytes). This is wasteful but correct. mmap (`memmap2`) handles sparse files more efficiently (zero-page holes are not physically read). The mmap threshold (files above which mmap is used instead of `read()`) is 64 MiB — most sparse files encountered in practice exceed this threshold.
 
 **Archives (zip, tar, gz, 7z, rar):**
-- Metadata-only in v0.1 (file count, total size, listing)
-- Content indexing (extract-and-index member files) deferred to v0.2
-- **GZ/BZ2/XZ distinction:** `.tar.gz` / `.tgz`, `.tar.bz2`, `.tar.xz` are detected when the decompressed inner stream is a valid tar archive. Standalone `.gz` / `.bz2` / `.xz` files (single compressed file, not a tarball) are treated as metadata-only archive entries in v0.1 — the inner file is not decompressed or indexed. Single-file decompression and inner-file indexing is deferred to v0.2 alongside general archive content extraction.
+
+Archive content is indexed in v0.1. Archives are progressively extracted in-memory and their members processed through the standard pipeline (MIME detect → extractor → chunker → BLAKE3 → embedder → index), just like regular files.
+
+**Supported archive formats (v0.1):**
+
+| Format | Crate | Notes |
+|---|---|---|
+| ZIP | `zip` | Random access; read each member sequentially |
+| TAR | `tar` | Streaming sequential read |
+| TAR.GZ / TGZ | `flate2` + `tar` | Streaming decompression → tar reader |
+| TAR.BZ2 | `bzip2` + `tar` | Same |
+| TAR.XZ | `xz2` / `liblzma` + `tar` | Same |
+| GZ/BZ2/XZ (single file) | `flate2`/`bzip2`/`xz2` | Decompress inner file in-memory, index the result |
+
+**Deferred to v0.2:** 7Z (`sevenz-rust`), RAR (`unrar` — native C dependency). These remain metadata-only (`status=1`, `extraction_status='metadata_only'` in `archive_meta`) in v0.1.
+
+**OOXML exclusion:** DOCX, XLSX, PPTX are ZIP-based but are NOT recursively unpacked — their dedicated extractors handle the ZIP structure internally. The archive extractor skips files whose MIME type already has a dedicated extractor.
+
+**Extraction flow:**
+1. Archive file is detected by MIME type during Phase 3.
+2. The archive is opened as a **streaming reader** — the archive file is read sequentially from disk (or mmap), never fully loaded into a second buffer.
+3. Each member entry is processed:
+   a. Member metadata is read (path, compressed size, uncompressed size).
+   b. Safety checks applied (see §4.9 archive safety).
+   c. Member content is decompressed into an in-memory `Vec<u8>` bounded at `max_file_size`.
+   d. The in-memory buffer goes through the standard pipeline: MIME detect → extractor → chunker → BLAKE3 hash → embedder → index writes.
+   e. Buffer is dropped before the next member — sequential, one member at a time.
+4. No temporary files are written to disk.
+
+**Member path convention:** `<archive_path>!/<member_internal_path>` — the `!/` delimiter (JAR URL convention) distinguishes archive boundaries from filesystem separators. Example: `/pool/docs/reports.tar.gz!/2024/Q3-report.pdf`. Nested archives: `outer.zip!/inner.tar.gz!/file.txt`.
+
+**Re-indexing:** When an archive's `(size, mtime_ns)` changes, all existing members (`parent_archive_id = archive_file_id`) are marked `status=3` (deleted) and the archive is re-extracted from scratch.
+
+When an archive is deleted, its entry is marked `status=3` and all members are cascade-marked `status=3`.
+
+**Display:** Archive member paths in search results:
+- Pretty format: `reports.tar.gz → 2024/Q3-report.pdf` (arrow separator)
+- JSON/paths format: `reports.tar.gz!/2024/Q3-report.pdf` (raw `!/` delimiter)
+- OSC 8 hyperlinks: link to the archive file itself (members cannot be directly opened)
+
+`ndex info` on an archive shows member count, total uncompressed size, and extraction status.
 
 ### 4.7 Embedding Pipeline
 
@@ -350,10 +388,10 @@ See §4.6 for the definitive policy. Summary:
 
 | Type | Detection | v0.1 behavior |
 |---|---|---|
-| `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz` | Inner stream is a valid tar archive | Metadata-only: member listing |
-| `.gz`, `.bz2`, `.xz` (single file) | Inner stream is not a tar archive | Metadata-only: treated as opaque archive entry; inner file not extracted |
+| `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz` | Inner stream is a valid tar archive | Full content extraction: members indexed |
+| `.gz`, `.bz2`, `.xz` (single file) | Inner stream is not a tar archive | Decompress inner file in-memory, index the result |
 
-Single-file decompression and inner-file indexing deferred to v0.2.
+Both tarball and single-file compressed formats are fully extracted in v0.1. See §4.6 for the complete archive extraction flow.
 
 #### Image EXIF: Per-Format Support Matrix
 
@@ -387,7 +425,7 @@ A scanned PDF with no text layer is a permanent extraction failure in v0.1 (no O
 
 - `pdf_oxide` extracts zero text bytes from the document.
 - **Classification: `status=4` (failed_permanent).** Rationale: the zero-text condition is permanent until OCR is available. Marking as `status=2` (failed_transient) would cause repeated retry attempts at every reconciliation with no benefit.
-- `error_msg`: `"PDF has no extractable text layer (possibly scanned). Re-index after OCR support is enabled (planned for v0.3)."`.
+- `error_msg`: `"[DEFERRED] PDF has no extractable text layer (possibly scanned). Re-index after OCR support is enabled (planned for v0.3)."`.
 - The file is still searchable by path, filename, and filesystem metadata.
 
 **Detection heuristic:** A PDF is classified as image-only if `pdf_oxide` extracts fewer than 20 characters from a document with at least 1 page. A legitimate single-page text PDF virtually always exceeds this threshold.
@@ -396,7 +434,7 @@ A scanned PDF with no text layer is a permanent extraction failure in v0.1 (no O
 
 - Both `pdf_oxide` and the `pdfium` fallback fail on encrypted PDFs without a password.
 - **Classification: `status=4` (failed_permanent).**
-- `error_msg`: `"PDF is encrypted or password-protected. Text extraction requires the password."`.
+- `error_msg`: `"[UNSUPPORTED] PDF is encrypted or password-protected. Text extraction requires the password."`.
 - Indexed by path and filesystem metadata only; no text content in FTS or vectors.
 
 #### Zero-Byte Files
@@ -448,7 +486,7 @@ ndex assumes UTF-8 for all text content. Non-UTF-8 files are handled with detect
 | XLSX text extraction | v0.2 | Metadata-only in v0.1 (see OOXML above) |
 | PPTX text extraction | v0.2 | Metadata-only in v0.1 (see OOXML above) |
 
-> **v0.1 behavior for deferred formats:** When a file matches a deferred format (RTF, EPUB, EML, MBOX, MSG, ODS, ODT, ODP), it is classified as `status=4` (failed_permanent) with `error_msg`: `"Format '<mime_type>' extraction not yet supported. Planned for <version>."` The file is indexed by path and filesystem metadata only. This differs from `status=5` (skipped) which implies the file was intentionally excluded (e.g., over size limit). `status=4` signals that extraction will be available in a future version.
+> **v0.1 behavior for deferred formats:** When a file matches a deferred format (RTF, EPUB, EML, MBOX, MSG, ODS, ODT, ODP), it is classified as `status=4` (failed_permanent) with `error_msg`: `"[DEFERRED] Format '<mime_type>' extraction not yet supported. Planned for <version>."` The file is indexed by path and filesystem metadata only. This differs from `status=5` (skipped) which implies the file was intentionally excluded (e.g., over size limit). `status=4` with `[DEFERRED]` prefix signals that extraction will be available in a future version and the file can be automatically re-processed when that version is installed.
 
 #### Explicitly Out-of-Scope
 
@@ -459,6 +497,72 @@ The following formats produce `status=4` (unsupported format) or archive/binary 
 - Proprietary creative-tool formats (`.psd`, `.ai`, `.sketch`, `.fig`) — indexed by path/metadata only
 - `.db`, `.sqlite` database files — not content-indexed (binary format; SQL dumps as `.sql` are indexed normally)
 - Font files (`.ttf`, `.otf`, `.woff`, `.woff2`, `.eot`) — binary format with no searchable text content; indexed by path/metadata only, `status=5` (skipped)
+
+#### `status=4` Error Message Conventions
+
+To distinguish deferred formats (re-processable in a future version) from permanently unsupported formats, the `error_msg` column uses the following prefixes:
+
+- **Deferred formats:** `error_msg` starts with `"[DEFERRED] Format '<mime>' not yet supported. Planned for <version>."` (e.g., RTF, EPUB, 7Z in v0.1)
+- **Out-of-scope formats:** `error_msg` starts with `"[UNSUPPORTED] Format '<mime>' is not supported."` (e.g., PST, DWG, PSD)
+- **Scanned PDFs:** `error_msg` starts with `"[DEFERRED] PDF has no extractable text layer (possibly scanned). Re-index after OCR support is enabled (planned for v0.3)."` (since OCR is planned for v0.3)
+- **Encrypted PDFs:** `error_msg` starts with `"[UNSUPPORTED] PDF is encrypted or password-protected. Text extraction requires the password."`
+
+This prefix scheme allows `ndex stats` to report deferred vs. unsupported separately, and allows future versions to automatically re-process deferred files when support is added (by scanning for `[DEFERRED]` prefix in `error_msg`).
+
+### 4.9 Archive Safety
+
+Archive decompression and extraction must never crash the indexing process regardless of input. The following limits and safeguards are enforced:
+
+#### Decompression Bomb Protection
+
+| Check | Limit | Behavior when exceeded |
+|---|---|---|
+| **Compression ratio** | 200:1 per member | Abort member; `status=4`, `error_msg = "[DEFERRED] Compression ratio <N>:1 exceeds limit (possible decompression bomb)"`. Continue to next member. |
+| **Total extracted size per archive** | `max_archive_total_size` (default: 8 GiB) | Stop extracting further members. Members extracted so far are kept. Archive `extraction_status = 'partial'`. Log `WARN`. |
+| **Per-member size** | `max_file_size` (default: 2 GiB) | Skip member; `status=5` (skipped). |
+| **Member count** | `max_archive_members` (default: 100,000) | Stop after N members. Archive `extraction_status = 'partial'`. |
+
+Ratio detection: track `bytes_read` (compressed) and `bytes_written` (decompressed) during streaming decompression. Check ratio every 1 MiB of output.
+
+#### Recursive Archive Depth Limit
+
+- `max_archive_depth` (default: 3, configurable).
+- Archives nested deeper than the limit are treated as opaque files: `status=5` (skipped), `error_msg = "Archive nesting depth <N> exceeds limit of <max>"`.
+- The depth counter is threaded through the extraction pipeline: regular files have depth 0, members of a top-level archive have depth 1, etc.
+
+#### Malformed Archive Handling
+
+- **Corrupted headers:** If the archive crate fails to open the archive, `status=4` (permanent), `error_msg` captures the library error. No members extracted.
+- **Truncated archive (unexpected EOF mid-stream):** All members extracted so far are kept. Archive gets `extraction_status = 'partial'` and `status=2` (transient) for retry — the file may be incomplete due to a concurrent write.
+- **Individual member extraction failure:** Isolated to that member. Other members continue normally.
+- **Invalid member paths:** Archive members with paths containing `../` (path traversal), absolute paths, or null bytes are skipped: `status=4`, `error_msg = "Unsafe member path"`.
+
+#### Panic Isolation
+
+All archive extraction (including calls into `zip`, `tar`, `flate2`, `bzip2`, `xz2` crates) is wrapped in `std::panic::catch_unwind`. If a third-party crate panics on malformed input, the panic is caught, the archive gets `status=2` (transient), and processing continues with the next file. The panic is logged at `ERROR` level. This does NOT protect against `abort()` or stack overflow in native code.
+
+#### Memory Bounding
+
+- Each member's decompressed content is read into a single `Vec<u8>`, pre-allocated to `min(member_header_size, max_file_size)`.
+- Only one member is decompressed in memory at a time (sequential processing). Peak memory per archive: `max_file_size` for the member buffer + streaming archive reader overhead (~64 KiB buffers).
+- The archive file itself is read via streaming I/O or mmap — NOT loaded into a second heap buffer.
+
+#### Archive Config Keys (add to §17 config reference)
+
+```toml
+[archive]
+max_archive_total_size = "8GiB"    # total decompressed bytes per archive
+max_archive_members = 100000        # max members to extract per archive
+max_archive_depth = 3               # max nesting depth for recursive archives
+compression_ratio_limit = 200       # max decompressed:compressed ratio per member
+```
+
+#### Archive Logging
+
+- `INFO`: `"Extracting archive <path>: <N> members, <size> total"`
+- `WARN`: `"Archive <path> extraction partial: hit member limit (100000)"`, `"Compression ratio exceeded for <archive>!/<member>"`
+- `DEBUG`: Per-member extraction: `"Extracted <archive>!/<member> (<size>, <mime>)"`
+- `ERROR`: Panic caught during archive extraction, corrupted archive header
 
 ---
 
@@ -625,7 +729,9 @@ cp ndex-remote ~/.local/bin/
 
 ### 7.3 Self-Update
 
-`ndex-remote` can update itself when the server admin requests it:
+> **v0.1:** `ndex-remote self-update` is a stub that prints: `"Self-update is planned for v0.2. Update manually via your package manager or: curl -fsSL https://get.ndex.dev/install.sh | sh"`. The full self-update mechanism described below is implemented in v0.2.
+
+`ndex-remote` can update itself when the server admin requests it (v0.2+):
 
 ```bash
 # On the server:
@@ -796,7 +902,8 @@ CREATE TABLE files (
     first_seen_ns  INTEGER NOT NULL,
     last_verified_ns INTEGER NOT NULL,
     error_msg      TEXT,
-    hard_link_of   INTEGER REFERENCES files(file_id)  -- NULL if not a hard link; canonical file_id if hard link
+    hard_link_of   INTEGER REFERENCES files(file_id), -- NULL if not a hard link; canonical file_id if hard link
+    parent_archive_id INTEGER REFERENCES files(file_id) -- NULL for regular files; archive's file_id for members
 );
 
 CREATE UNIQUE INDEX idx_path ON files(path);  -- prevents duplicate path entries at DB level
@@ -807,6 +914,7 @@ CREATE INDEX idx_mtime ON files(mtime_ns);
 CREATE INDEX idx_mime ON files(mime_type) WHERE mime_type IS NOT NULL;
 CREATE INDEX idx_size ON files(size);
 CREATE INDEX idx_hard_link ON files(hard_link_of) WHERE hard_link_of IS NOT NULL;
+CREATE INDEX idx_parent_archive ON files(parent_archive_id) WHERE parent_archive_id IS NOT NULL;
 
 -- index_progress: presence of a row means "successfully completed for this index",
 -- NOT "attempted". A row is inserted only after the index write for this file+index_name
@@ -911,6 +1019,8 @@ CJK tokenization deferred to v0.2. CJK text uses default Unicode word tokenizer 
 **Unicode normalization:** All indexed text and search queries are NFC-normalized before tokenization (`unicode-normalization` crate). This ensures `café` (NFD: `cafe\u0301`) and `café` (NFC: `caf\u00e9`) match identically. macOS writes NFD paths/content; Linux writes NFC; normalization to NFC at ingest time prevents missed matches across platforms.
 
 **Commit strategy:** Tantivy `IndexWriter::commit()` is called periodically during indexing to flush segments to disk and make documents visible to readers. ndex commits every **10,000 documents** or every **30 seconds**, whichever comes first. A final commit is issued at the end of each Phase 3 batch. This balances write throughput (fewer commits = less overhead) against crash recovery granularity (more frequent commits = fewer documents to re-index after a crash). The commit interval is not currently user-configurable.
+
+**Directory entries in Tantivy:** Directories get a Tantivy document with `path_text` populated (tokenized by the path tokenizer — split on `/` and `.`, trigrams per component) and empty `body`/`title`. This enables path searches like `--path 'src/components/*'` and FTS queries matching directory names. Directories do NOT receive vector embeddings (no text content to embed). They do not appear in semantic search results.
 
 **Threading:** Tantivy's `IndexWriter` uses a single writer with internal per-thread document buffers. Multiple extraction workers prepare documents and call `add_document()` concurrently — Tantivy handles the internal synchronization. Only one `IndexWriter` instance should exist per index. Search readers (`IndexReader`) are fully concurrent and lock-free.
 
@@ -1022,6 +1132,15 @@ CREATE TABLE file_tags (
     PRIMARY KEY (file_id, tag_id)
 ) WITHOUT ROWID;
 
+-- archive_meta: summary metadata for archive files
+CREATE TABLE archive_meta (
+    file_id           INTEGER PRIMARY KEY,
+    member_count      INTEGER,
+    total_size        INTEGER,    -- total uncompressed size in bytes
+    format            TEXT,       -- 'zip', 'tar', 'tar.gz', 'tar.bz2', 'tar.xz', 'gz', 'bz2', 'xz', '7z', 'rar'
+    extraction_status TEXT        -- 'complete', 'partial' (hit member/size limit), 'metadata_only' (unsupported format)
+);
+
 -- NER entities table: deferred to v0.2. Schema will be defined when NER is implemented.
 -- Adding it will require a schema version bump and reindex (per §5 no-migration policy).
 ```
@@ -1032,6 +1151,7 @@ CREATE TABLE file_tags (
 > - **HTML:** `<title>` → `title`, `<meta name="author">` → `author`, `<meta name="description">` → `subject`. Other fields NULL.
 > - **Markdown:** `title` is set to the first `# heading` if present. Other fields NULL (or populated from frontmatter in v0.2).
 > - **All other formats:** `doc_meta` row is not created for plaintext, code, CSV, JSON, SQL, log, config formats. These have no structured document metadata.
+> - **Archive members:** Members inherit filesystem metadata from the parent archive file (`mtime_ns`, `ctime_ns`, `uid`, `gid`, `dev`). The member's own `mtime_ns` from the archive header overrides if available. `inode` is NULL for archive members. `size` is the uncompressed member size. `hard_link_of` is NULL for archive members. `blake3` is computed from the decompressed member content.
 
 ### 10.5 Thumbnail Store — `thumbs/`
 
@@ -1106,11 +1226,13 @@ The server determines the actual search mode based on query characteristics:
 |---|---|
 | Contains quoted phrases (`"exact phrase"`) | `fts` |
 | Uses FTS operators (`AND`, `OR`, `NOT`, `field:term`) | `fts` |
-| Short (≤ 3 tokens), looks like a keyword | `fts` |
+| Short (≤ 3 tokens) AND no stop words (the, a, an, is, are, was, were, in, on, at, for, to, of, with, by, from, how, what, why, when, where, which, who) | `fts` |
 | Longer natural language (> 3 tokens, no operators) | `hybrid` |
 | Vector index absent or empty | `fts` (fallback with warning) |
 
 The selected mode is reported in `SearchResult.mode` and displayed in the result footer.
+
+> **Stop-word routing rationale:** The presence of a stop word in a short query signals natural language intent (e.g., "what is X"), routing to `hybrid`. Pure keyword queries (e.g., "blake3", "config.toml", "ERR_TIMEOUT") route to `fts`. Queries longer than 3 tokens always route to `hybrid` regardless of stop words.
 
 #### Score Normalization for Display
 
@@ -1157,7 +1279,9 @@ If `ignore.respect_gitignore = false` in config, pass `.git_ignore(false)`.
 
 Produces `DashMap<PathBuf, WalkEntry>` where `WalkEntry = { size, mtime_ns, ctime_ns, inode, dev, mode }`.
 
-> **Non-regular files:** The Phase 1 walker skips non-regular files: FIFOs (named pipes), Unix domain sockets, block/character device files, and broken symlinks (symlinks whose target does not exist). These are silently excluded — no manifest entry is created, no warning is logged (these are expected filesystem entries, not errors). Only regular files and followed symlinks to regular files are indexed. The `ignore` crate's `WalkBuilder` handles this via `file_type()` filtering.
+> **Directory entries:** In addition to regular files, Phase 1 also collects directory entries. The `ignore` crate's `WalkBuilder` yields `DirEntry` for both files and directories. Directory entries are collected into a separate `DashMap<PathBuf, DirWalkEntry>` where `DirWalkEntry = { mtime_ns, ctime_ns, inode, dev, mode }` (no `size` — directory size is meaningless on most filesystems). Directory entries are added to the manifest with `mime_type = 'inode/directory'`, `status = 1` (indexed), `blake3 = NULL`, `size = 0`. No chunks, no FTS `body`/`title`, no vectors, no `doc_meta`/`media_meta`. Directories participate in Phase 2 diff (new → insert, deleted → `status=3`, mtime changed → update `mtime_ns`). No Phase 3 processing needed for directories.
+
+> **Non-regular files:** The Phase 1 walker skips non-regular files: FIFOs (named pipes), Unix domain sockets, block/character device files, and broken symlinks (symlinks whose target does not exist). These are silently excluded — no manifest entry is created, no warning is logged (these are expected filesystem entries, not errors). Only regular files, directories, and followed symlinks to regular files are indexed. The `ignore` crate's `WalkBuilder` handles this via `file_type()` filtering.
 
 > **Memory requirements:** Phase 1 walk builds a `DashMap` of all file metadata (~270 bytes/file). Phase 2 diff loads the manifest into a second `HashMap` (~200 bytes/file). Total: ~470 bytes/file across both phases simultaneously. At 10M files: ~5 GB RAM. At 50M files: ~25 GB RAM. Systems indexing 50M+ files should have at least 32 GB RAM available for ndex-remote.
 >
@@ -1197,6 +1321,8 @@ Phase 2 is parallelized via `rayon::par_iter()` over walk results. The manifest 
 **Phase 3: Process** — extract, hash, chunk, embed, index.
 
 > **Hard link dedup (MEDIUM):** Multiple paths may resolve to the same inode (`dev + inode` pair). During Phase 2 diff, track `(dev, inode)` pairs already queued. If a new path maps to an already-queued inode, insert it in the manifest with its own `file_id` but mark it with the canonical `file_id` in a `hard_link_of` column (NULL if not a hard link). During Phase 3, skip re-extraction for hard link paths — insert duplicate USearch vectors pointing to the new `file_id`. Both paths are independently searchable and appear as separate results. This avoids the complexity of inode-sharing in the vector index at the cost of duplicated vectors.
+>
+> **Search dedup (v0.1):** When search results contain multiple hard-linked paths to the same content (same `blake3` hash), all paths appear in results. No dedup is applied — hard links are semantically distinct filesystem entries and the user may want to find all locations. `ndex dedup` (v0.2) is the tool for identifying and acting on duplicates.
 
 > **TOCTOU guard (MEDIUM):** After extracting a file, re-stat it and compare `(size, mtime_ns)` against the values captured during Phase 1 walk. If they differ (file was modified between walk and extraction), discard the extraction result and mark the file `status=2` (failed_transient) for retry on the next run. This prevents stale content from being indexed.
 >
@@ -1323,6 +1449,8 @@ Length-prefixed frames:
 │ (big-endian)│ (msgpack-encoded Message)   │
 └─────────────┴────────────────────────────┘
 Max frame: 16 MiB
+
+**Frame overflow handling:** If a received frame's length prefix exceeds 16 MiB, the receiver closes the connection immediately with an `Error` message (if possible) containing: `"Frame size <N> exceeds 16 MiB limit."` The receiver does NOT attempt to read the oversized payload. The sender is responsible for ensuring payloads fit within the limit. In practice, the only messages approaching this limit are `SearchResult` with many hits, which are paginated by `limit` (default 20). If a single `SearchHit` somehow exceeds 16 MiB (pathological snippet), the server truncates the snippet before framing.
 ```
 
 **Magic preamble (SSH stdout contamination mitigation):**
@@ -1462,6 +1590,7 @@ struct SearchResultData {
 
 struct IndexCompleteData {
     stats: IndexStats,
+    cancelled: bool,    // true if the operation was stopped by CancelRequest
 }
 
 struct InfoResultData {
@@ -1642,6 +1771,7 @@ struct IndexStats {
 
 struct IndexSummary {
     total_files: u64,
+    directories: u64,       // directory entries (counted in total_files, not in processed)
     indexed: u64,
     pending: u64,
     failed_transient: u64,
@@ -1772,12 +1902,15 @@ ndex index [HOST:]<PATH> [OPTIONS]
     --batch-size <N>    Embedding batch size [default: 64]
     --no-vectors        Skip vector embedding
     --enable-ner        Enable named entity recognition
+                        [v0.1: accepted but ignored with warning — NER is planned for v0.2]
     --max-file-size <S> Skip files above this size
     --only-new          Process only new files (skip modified)
     --status            Show current indexing status and exit
 ```
 
 Running `ndex index` after a crash automatically retries `status=0` files (crash recovery per §11.2).
+
+> **v0.1 `--enable-ner` behavior:** The flag is accepted but ignored with a warning: `"NER is not available in v0.1. Flag ignored."` The flag exists in the protocol and CLI for forward-compatibility — clients built for v0.2 will send it, and v0.1 servers must not reject the message.
 
 ### 13.4 `ndex init`
 
@@ -1804,9 +1937,11 @@ ndex init <PATH> [OPTIONS]
 
 ```
 ndex info [HOST:]<PATH> <FILE>
-    Show metadata for a specific file in the index.
+    Show metadata for a specific file or directory in the index.
     Outputs: path, size, mtime, mime, blake3, status, tags,
              doc/media metadata, chunk count, index membership.
+    For directories: path, mtime, children count from manifest.
+    For archives: member count, total uncompressed size, extraction status.
     -f, --format <FMT>      pretty | json
 
 ndex stats [HOST:]<PATH>
@@ -1885,7 +2020,16 @@ struct ProgressEvent {
     message: Option<String>,
     children: Vec<ProgressChild>,
 }
+
+struct ProgressChild {
+    label: String,          // e.g., "worker-3", "embed", "fts-write"
+    current: u64,
+    total: Option<u64>,
+    message: Option<String>,
+}
 ```
+
+`children` represents sub-tasks within a phase (e.g., individual extraction workers during Phase 3, or the embed/fts-write sub-pipelines). The client renders these as nested progress bars when the terminal is tall enough, or as a summary line otherwise.
 
 The client renders these. The remote knows nothing about terminal capabilities — it sends structured progress, the client decides how to display.
 
@@ -1988,6 +2132,8 @@ This sets `status=3` in the manifest and removes entries from FTS and meta. The 
 
 ### 13.9 `ndex compact`
 
+> **v0.2 command.** Compiled as a stub in v0.1 — invoking it prints: `"ndex compact is planned for v0.2. To reclaim vector space in v0.1, use: ndex reindex --vectors"`. See §13.8 `ndex delete` for the v0.1 workaround for reclaiming vector tombstone space.
+
 ```
 ndex compact [HOST:]<PATH> [OPTIONS]
     Optimize index storage by reclaiming space from deleted/updated entries.
@@ -2081,7 +2227,7 @@ Each file path is an OSC 8 hyperlink (when supported). Matched query terms are h
 - Reconciler (parallel walk, metadata diff, BLAKE3 hashing)
 - Manifest (SQLite WAL), FTS (tantivy), vectors (USearch + snowflake-arctic-embed-m-v2.0, 256d MRL)
 - Metadata index (doc_meta, media_meta)
-- Extraction: pdf, docx, txt, md, html, code, images (EXIF)
+- Extraction: pdf, docx, txt, md, html, code, images (EXIF), archives (ZIP, TAR family, single-file GZ/BZ2/XZ)
 - CLI: `init`, `index`, `search` (fts/semantic/hybrid), `info`, `stats`, `reindex`, **`delete`**, `verify`, `config`, `completions`
 - `delete` is v0.1 because users must be able to remove accidentally indexed sensitive files without a full reindex
 - SSH remote with version negotiation
@@ -2106,13 +2252,19 @@ Each file path is an OSC 8 hyperlink (when supported). Matched query terms are h
 | `ndex config` | v0.1 | view/edit config; write not required for launch |
 | `ndex completions` | v0.1 | |
 | `ndex verify` | v0.1 | simple: read file, compute BLAKE3, compare against manifest |
-| `ndex tag` | v0.2 | |
-| `ndex dedup` | v0.2 | |
-| `ndex compact` | v0.2 | |
+| `ndex tag` | v0.2 | stub in v0.1: prints planned-for-v0.2 message |
+| `ndex dedup` | v0.2 | stub in v0.1: prints planned-for-v0.2 message |
+| `ndex compact` | v0.2 | stub in v0.1: see §13.9 |
+
+**v0.2 command descriptions (for help text authoring):**
+
+> **`ndex dedup [HOST:]<PATH>`** — Finds duplicate files by BLAKE3 hash. Groups files sharing the same `(blake3, size)` pair. Outputs: groups of duplicate paths, total wasted space. Options: `--format pretty|json`, `--min-size <SIZE>` (ignore small files), `--delete-duplicates` (interactive, keeps one copy). v0.2.
+
+> **`ndex tag [HOST:]<PATH> <SUBCOMMAND>`** — Manage tags on indexed files. Subcommands: `add <FILE> <TAG>`, `remove <FILE> <TAG>`, `list [FILE]`, `search <TAG>`. Tags are stored in `meta.db` (schema exists, see §10.4). v0.2.
 
 ### v0.2 — Breadth
 
-- CJK tokenizers, archive indexing, email indexing
+- CJK tokenizers, 7Z and RAR archive content extraction, email indexing
 - Tags, NER, dedup, compact
 - Thumbnails (deferred from v0.1), CUDA embedding
 - `ndex-remote self-update`
@@ -2141,7 +2293,7 @@ Each file path is an OSC 8 hyperlink (when supported). Matched query terms are h
 
 2. **RESOLVED: CancelRequest behavior.** `CancelRequest` is defined in the protocol (§12.4) but its behavior is unspecified.
    - **Decision:** On receiving `CancelRequest`, the server finishes the current in-flight extraction (cannot be interrupted safely mid-file), flushes the SQLite WAL, and sends `IndexComplete` with whatever was indexed before the cancel. For search, cancel is a no-op (search completes fast enough). For long-running index operations, the current batch commits and the server exits cleanly.
-   - **Response type:** The response to a `CancelRequest` is always the in-progress operation's normal completion message — `IndexComplete` for index/reindex operations. There is no separate `CancelAck` message type. The `IndexComplete` message indicates that processing stopped early via `stats.timed_out = true` (reused flag) or a new `cancelled: bool` field in `IndexCompleteData` (to be added in implementation). Clients should treat a `CancelRequest` as asynchronous: after sending it, they wait for the next `IndexComplete` or `Error` message.
+   - **Response type:** The response to a `CancelRequest` is always the in-progress operation's normal completion message — `IndexComplete` for index/reindex operations. There is no separate `CancelAck` message type. The `IndexComplete` message indicates processing stopped early via `cancelled: bool` in `IndexCompleteData` (see §12.4). Clients should treat a `CancelRequest` as asynchronous: after sending it, they wait for the next `IndexComplete` or `Error` message.
 
 3. **RESOLVED: Search with empty vector index.** On first run, no vectors exist. What does `ndex search` return in `semantic` or `hybrid` mode?
    - **Decision:** If the vector index is empty (0 entries), semantic mode returns 0 results with a warning: "Vector index is empty. Run `ndex index` to build the index." Hybrid mode falls back to FTS-only with a warning. `auto` mode selects `fts` if the vector index is empty (per the heuristics in §10.7).
@@ -2204,7 +2356,9 @@ max_retries = 3
 
 [embedding]
 batch_size = 64
-threads = 0           # 0 = all available cores
+threads = 0               # alias for intra_op_threads (backward compat)
+intra_op_threads = 0      # threads within a single ONNX op (0 = all cores)
+inter_op_threads = 1      # threads for independent graph node scheduling (default: 1)
 
 [auto_refresh]
 enabled = true
@@ -2227,4 +2381,104 @@ rrf_k = 60
 title_boost = 2.0     # BM25 field weight for title field in FTS scoring
 fts_weight = 1.0      # RRF component multiplier for FTS score in hybrid mode
 ef_search = 128
+
+[archive]
+max_archive_total_size = "8GiB"    # total decompressed bytes per archive
+max_archive_members = 100000        # max members to extract per archive
+max_archive_depth = 3               # max nesting depth for recursive archives
+compression_ratio_limit = 200       # max decompressed:compressed ratio per member
 ```
+
+### 17.1 Instrumentation
+
+ndex uses `tracing` (not `log`) as the sole instrumentation layer across all crates. `tracing` subsumes `log` via the `tracing-log` compatibility layer.
+
+**Setup:**
+- `tracing-subscriber` with `fmt` layer for human-readable stderr output.
+- `EnvFilter` driven by `NDEX_LOG` (replaces a raw `log`-based approach). Format: `ndex_remote=debug,tantivy=warn`.
+- The `--log-file` flag uses `tracing_appender` for non-blocking file output.
+
+**Instrumentation policy:**
+- `#[tracing::instrument]` on all public API boundaries and cross-component calls: reconciler phases, extractor entry points, embedding batches, search query handlers, IPC message handlers, SQLite transactions.
+- **Skip** `#[instrument]` on tight inner loops where overhead would be measurable: per-token chunking, per-byte BLAKE3 streaming, per-vector USearch add.
+
+**Structured span fields:**
+- `file_id`, `path` (lossy UTF-8), `phase`, `mime_type`, `chunk_count`, `batch_size`, `query` — enables searchability in structured log sinks.
+
+**Async span propagation:**
+- `tracing::Span` context is propagated across async boundaries. Crossbeam channels carry span context for the extraction → embedding → write pipeline.
+
+**Wire protocol:**
+- `TRACE`-level span per frame with fields `msg_kind`, `payload_len`.
+
+**Future-proofing:**
+- `tracing` supports `opentelemetry` and `tokio-console` subscribers. No v0.1 requirement to enable these — the tracing foundation makes them zero-cost additions in v0.2+.
+
+---
+
+## 18. Testing Strategy
+
+### 18.1 Test Categories
+
+**Unit tests:** Per-module. Focus areas:
+- Extractors: one test per format with a fixture file covering the happy path
+- Chunking: boundary conditions (empty input, single token, exactly `target_tokens`, exactly `target_tokens + 1`, all-heading document)
+- BLAKE3 computation: known-good hash vectors
+- Path handling: non-UTF-8 filenames, null bytes, extremely long paths
+- Search scoring: BM25 field boost math, cosine similarity on known vectors, RRF fusion with known ranks
+
+**Integration tests:** Full `init → index → search` round-trip against a temporary directory with fixture files. Covers all v0.1 formats (PDF, DOCX, Markdown, HTML, code, images, archives, plaintext). Validates:
+- Manifest state after indexing (correct status, BLAKE3, MIME)
+- FTS search returns expected results for known queries
+- Semantic search returns expected results (top-k accuracy on fixture corpus)
+- Metadata populated correctly (`doc_meta`, `media_meta`)
+- Archive members indexed with correct synthetic paths
+
+**Protocol round-trip tests:** Serialize and deserialize every `ClientMessage` and `ServerMessage` variant using `rmp_serde::to_vec_named()` / `from_slice()`. Verify that the round-trip produces identical values. Run these before the protocol is considered stable (§12.4).
+
+**Crash recovery tests:**
+- Kill `ndex-remote` mid-index (SIGKILL) at various points (post-walk, mid-Phase 3, mid-embed)
+- Restart and verify recovery from `status=0` files
+- Verify sidecar/USearch mismatch repair (inject a mismatch by corrupting the sidecar count)
+
+**SSH transport tests:** Use a local SSH server (or `ssh localhost`) to test the full thin-client → SSH → ndex-remote → SSH → thin-client path, including:
+- Magic preamble detection with injected stdout garbage
+- Protocol version negotiation
+- CancelRequest over SSH
+
+**Performance regression tests (advisory, non-blocking):** Track wall-clock time for walk, diff, extract, embed, and search phases on a fixed corpus (10,000 files representative of the v0.1 format mix). Run in CI; alert on > 20% regression. These tests are advisory — they do not block merge, but regressions are investigated before release.
+
+### 18.2 Test Corpus
+
+Maintain a `tests/fixtures/` directory with representative files for each format. Include edge cases:
+- Zero-byte file
+- BOM-prefixed UTF-16 text
+- Non-UTF-8 filename (Latin-1 encoded path component)
+- Scanned PDF (no text layer) → expected `status=4`
+- Encrypted PDF → expected `status=4`
+- Hard-linked pair (two paths, one inode)
+- Symlink cycle (A → B → A)
+- `.ndexignore` pattern file (verify excluded paths are not indexed)
+- Archive with path traversal member (`../../../etc/passwd`) → expected member skip
+- Archive with compression ratio > 200:1 (decompression bomb) → expected member skip
+- Deeply nested archive (depth > 3) → expected depth-limit skip
+
+### 18.3 Backup and Recovery
+
+#### Safe Backup Methods
+
+`.ndex/` cannot be safely copied while `ndex-remote` is running with active WAL transactions. Safe backup methods:
+
+1. **WAL checkpoint then copy:** Run `ndex-remote checkpoint --root /pool` (issues `PRAGMA wal_checkpoint(TRUNCATE)` on both databases, folding WAL into main DB files). Then copy `.ndex/` while no ndex-remote process is running.
+
+2. **ZFS/Btrfs snapshots:** Safe because they are atomic at the filesystem level. The snapshot captures a consistent point-in-time, and SQLite's WAL recovery handles any in-flight transactions on restore.
+
+3. **SQLite online backup API:** `sqlite3 manifest.db ".backup /tmp/manifest.db"` for per-database hot backup while ndex-remote is running. Both databases must be backed up in sequence (manifest.db first, then meta.db).
+
+#### Recovery from Backup
+
+Copy `.ndex/` back to its original location. `ndex-remote` runs WAL recovery on open. If the backup was taken mid-index, crash recovery (§11.2) handles any `status=0` files.
+
+#### Full Rebuild as Disaster Recovery
+
+The index is derived data — always rebuildable from source files via `ndex reindex`. Backup is a convenience optimization to avoid rebuild time, not a requirement for correctness.
