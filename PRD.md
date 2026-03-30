@@ -1,8 +1,8 @@
 # PRD: `ndex` — Deep File Indexer for Archival Storage
 
 **Version:** 0.3.0-draft
-**Date:** 2026-03-23
-**Status:** Draft (pre-implementation amendments applied 2026-03-23)
+**Date:** 2026-03-29
+**Status:** Draft (pre-implementation amendments applied 2026-03-23; format coverage amendments applied 2026-03-29)
 
 ---
 
@@ -139,10 +139,15 @@ BLAKE3 hashes are stored in the `blake3` column of the `files` table in `manifes
 | HTML | `lol-html` | Streaming; `scraper` for DOM queries when structure needed |
 | Code | `tree-sitter` | Parses full in-memory buffer; language-specific grammars |
 | Images (EXIF) | `kamadak-exif` | Pure-Rust EXIF extraction; v0.1 image metadata only |
+| MIME detection | `infer` + `mime_guess` | Magic-byte sniffing (primary) + extension fallback; see §4.8 |
 
 > **v0.1 scope:** For DOCX, accept best-effort structure extraction. If `docx-rust` cannot extract heading styles (e.g., malformed file), fall back to paragraph-boundary splitting. Log a warning and set `status=2` (failed_transient) only if no text can be extracted at all.
 
 > **pdfium distribution:** The `pdfium` fallback requires a native shared library (`libpdfium.so` / `pdfium.dll` / `libpdfium.dylib`, ~25 MB). Distribution strategy for v0.1: bundle the prebuilt `pdfium` binary inside the `ndex-remote` release tarball alongside the binary, and load it via `LD_LIBRARY_PATH` or a relative `rpath`. The install script places it in the same directory as `ndex-remote`. The `pdfium-render` crate's `auto` feature can download prebuilt pdfium at build time for dev convenience. For distribution builds, pin to a specific pdfium version and include in the release artifact. Users on unsupported architectures can disable the pdfium fallback at compile time (`--no-default-features`).
+
+> **MIME type detection:** ndex uses a two-pass detection strategy: `infer` crate (magic-byte sniffing, ~400 known signatures) as the primary source, falling back to `mime_guess` (extension-based) when `infer` returns `None`. When extension and magic bytes disagree (e.g., a `.txt` file that is actually gzip-compressed), the magic-byte result takes precedence, logged at `DEBUG` level. Extensionless files rely on magic bytes alone; if unidentifiable, they are classified as `application/octet-stream` and skipped (`status=5`). The detected `mime_type` is stored in the manifest and determines which extractor is invoked. See §4.8 for format-specific routing decisions and edge cases.
+
+> **tree-sitter language detection:** Language selection for the code extractor follows three steps: (1) **Extension lookup** — a static table maps extensions to tree-sitter grammars (`.rs`→Rust, `.py`→Python, `.js`→JavaScript, `.ts`→TypeScript, `.c`/`.h`→C, `.cpp`/`.cxx`/`.hpp`→C++, etc.). (2) **Shebang detection** — if no extension match and the first line starts with `#!`, the interpreter name is parsed (e.g., `#!/usr/bin/env python3` → Python). (3) **Plaintext fallback** — if no grammar is available for the detected language, the file falls through to the plaintext extractor, logged at `DEBUG` level. Ambiguous cases in v0.1: `.h` → C (not C++), `.m` → Objective-C. These are pragmatic defaults for archive workloads where C is more prevalent.
 
 ### 4.5 Chunking Strategy
 
@@ -172,7 +177,8 @@ BLAKE3 hashes are stored in the `blake3` column of the `files` table in `manifes
 | Code | `tree-sitter` | Functions, classes, modules |
 | Plaintext | Recursive splitter | `\n\n` > `\n` > `. ` > ` ` |
 | Logs | Line-based | Timestamp patterns, fixed line batches |
-| CSV/JSON | Record-based | Row/object boundaries, header propagation |
+| CSV | Record-based | Row boundaries; header propagation; delimiter auto-detected (`,` vs `\t`); quoted newlines handled |
+| JSON | Record-based | Variant-aware: single object → split at top-level keys; JSON array → split at element boundaries; NDJSON → split at line boundaries |
 | SQL | Statement-based | `;` delimiters |
 
 **Normalized block types:** `Heading(level)`, `Paragraph`, `CodeBlock(lang)`, `ListItem`, `Table`, `Quote`, `Raw`
@@ -209,6 +215,7 @@ heading_prefix = true   # prepend section heading to each chunk
 **Archives (zip, tar, gz, 7z, rar):**
 - Metadata-only in v0.1 (file count, total size, listing)
 - Content indexing (extract-and-index member files) deferred to v0.2
+- **GZ/BZ2/XZ distinction:** `.tar.gz` / `.tgz`, `.tar.bz2`, `.tar.xz` are detected when the decompressed inner stream is a valid tar archive. Standalone `.gz` / `.bz2` / `.xz` files (single compressed file, not a tarball) are treated as metadata-only archive entries in v0.1 — the inner file is not decompressed or indexed. Single-file decompression and inner-file indexing is deferred to v0.2 alongside general archive content extraction.
 
 ### 4.7 Embedding Pipeline
 
@@ -265,6 +272,134 @@ Max query length: **512 tokens** (model limit). Queries exceeding this are trunc
 At index time, chunks are batched for inference.
 
 Throughput on a 16-core server: ~4,000 chunks/sec. At 512 tokens/chunk, this is the primary bottleneck for large text archives. (see config reference in §17)
+
+### 4.8 Format Coverage Policy and Edge Cases
+
+#### OOXML Formats (XLSX, PPTX)
+
+XLSX and PPTX are ZIP archives containing XML (OOXML format), like DOCX. In v0.1:
+
+- **XLSX** (`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`): Detected by magic bytes. Treated as archive metadata-only (file count, member listing) — the same path as ZIP. Text extraction from spreadsheet cells is deferred to v0.2.
+- **PPTX** (`application/vnd.openxmlformats-officedocument.presentationml.presentation`): Same policy. Metadata-only in v0.1.
+
+The rationale for not treating these as plaintext: OOXML XML internals (shared-strings tables, formula references, cell coordinates) produce noisy, low-quality text when naively extracted. A dedicated XLSX/PPTX extractor is required for useful results.
+
+**Unknown ZIP-based document formats:** Any ZIP file whose MIME type is not explicitly handled (e.g., an ODS or EPUB file not yet in the v0.1 format table) falls through to the archive metadata path — file count, total size, member listing, `status=1` (indexed as archive). It is not classified as `status=5` (skipped) or `status=4` (failed_permanent).
+
+#### XML
+
+XML files (`.xml`, `application/xml`, `text/xml`) are handled by the HTML extractor path (`lol-html` / `scraper`). lol-html's lenient tag handling produces acceptable results for well-formed XML. For severely malformed XML that `lol-html` cannot parse, the plaintext fallback applies. A dedicated XML extractor is not warranted in v0.1 given the diversity of XML dialects.
+
+#### Config and Markup Formats (Plaintext Path)
+
+The following formats are treated as plaintext (recursive `\n\n` splitter, §4.5). They are not listed in the §4.5 extraction table because their handling is identical to plain text — no per-format structure signals are used.
+
+| Extension / Format | MIME type | Notes |
+|---|---|---|
+| `.yaml`, `.yml` | `text/yaml` / `application/yaml` | Human-readable config; plaintext splitter works well |
+| `.toml` | `application/toml` | Same |
+| `.ini`, `.cfg`, `.conf` | `text/plain` | Same |
+| `.rst` (reStructuredText) | `text/x-rst` | Heading underline markers (`===`, `---`) act as paragraph boundaries |
+| `.adoc`, `.asciidoc` (AsciiDoc) | `text/asciidoc` | Treated as plaintext |
+| `.tex` (LaTeX) | `application/x-tex` | Treated as plaintext; TeX commands appear as-is in indexed text |
+
+#### JSON Variants
+
+JSON in archives comes in three forms, distinguished by heuristic inspection of the first non-whitespace character and initial structure:
+
+| Variant | Detection heuristic | Chunking strategy |
+|---|---|---|
+| Single JSON object | File starts with `{` | Indexed as single document; split at top-level key boundaries if > `target_tokens` |
+| JSON array of objects | File starts with `[` | Split at array element boundaries (`}, {`) |
+| NDJSON / JSON Lines | Multiple top-level values, one per line | Split at line boundaries (each line is a record) |
+
+Files that do not parse as valid JSON fall back to the plaintext extractor.
+
+#### GZ/BZ2/XZ: Single-File vs. Tarball
+
+See §4.6 for the definitive policy. Summary:
+
+| Type | Detection | v0.1 behavior |
+|---|---|---|
+| `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz` | Inner stream is a valid tar archive | Metadata-only: member listing |
+| `.gz`, `.bz2`, `.xz` (single file) | Inner stream is not a tar archive | Metadata-only: treated as opaque archive entry; inner file not extracted |
+
+Single-file decompression and inner-file indexing deferred to v0.2.
+
+#### Image EXIF: Per-Format Support Matrix
+
+`kamadak-exif` provides EXIF data for a subset of image formats. The `image` crate is used for pixel dimensions on all formats.
+
+| Format | EXIF support | Fields populated in `media_meta` |
+|---|---|---|
+| JPEG / `.jpg` | Full | All fields: camera, GPS, taken_at, ISO, aperture, focal_length, shutter_speed |
+| TIFF | Full | Same as JPEG |
+| HEIC / HEIF | Full (EXIF in HEIC container) | Same as JPEG |
+| WebP | Partial | WebP with EXIF segment: full fields. Lossless WebP (VP8L) with no EXIF segment: `width`, `height` only |
+| PNG | None (PNG uses tEXt/iTXt chunks, not EXIF) | `width`, `height` only; all EXIF fields NULL |
+| GIF | None | `width`, `height` only; all EXIF fields NULL |
+
+For PNG and GIF, a `media_meta` row is still inserted with `width` and `height` populated. NULL EXIF fields are not an error — these formats simply do not carry EXIF.
+
+> **PNG tEXt/iTXt metadata** (e.g., `Author`, `Comment`, `Creation Time`): not extracted in v0.1. Deferred to v0.2.
+
+#### PDF: Scanned / Image-Only Documents
+
+A scanned PDF with no text layer is a permanent extraction failure in v0.1 (no OCR until v0.3):
+
+- `pdf_oxide` extracts zero text bytes from the document.
+- **Classification: `status=4` (failed_permanent).** Rationale: the zero-text condition is permanent until OCR is available. Marking as `status=2` (failed_transient) would cause repeated retry attempts at every reconciliation with no benefit.
+- `error_msg`: `"PDF has no extractable text layer (possibly scanned). Re-index after OCR support is enabled (planned for v0.3)."`.
+- The file is still searchable by path, filename, and filesystem metadata.
+
+**Detection heuristic:** A PDF is classified as image-only if `pdf_oxide` extracts fewer than 20 characters from a document with at least 1 page. A legitimate single-page text PDF virtually always exceeds this threshold.
+
+#### PDF: Encrypted / Password-Protected Documents
+
+- Both `pdf_oxide` and the `pdfium` fallback fail on encrypted PDFs without a password.
+- **Classification: `status=4` (failed_permanent).**
+- `error_msg`: `"PDF is encrypted or password-protected. Text extraction requires the password."`.
+- Indexed by path and filesystem metadata only; no text content in FTS or vectors.
+
+#### Zero-Byte Files
+
+Files with `size = 0` bytes:
+
+- No extraction is attempted.
+- `status=1` (indexed). A zero-byte file is not a failure; it is a valid filesystem entry.
+- BLAKE3 is computed (BLAKE3 of an empty input is defined and stored).
+- No chunks are produced; no FTS or vector entries are created.
+- `doc_meta` / `media_meta` rows are not created.
+- The file appears in path-based searches and `ndex info`.
+
+#### Very Small Files (< `min_tokens`)
+
+Files that produce fewer than `min_tokens` (default: 32) tokens after extraction:
+
+- The extracted text is indexed as a **single chunk** regardless of size.
+- `min_tokens` is the minimum size for the *splitter* — it does not gate whether a file is indexed. A 5-token file produces one 5-token chunk and is fully indexed.
+- `status=1` (indexed).
+
+#### Deferred Formats
+
+| Format | Deferred to | Notes |
+|---|---|---|
+| EPUB (`.epub`) | v0.2 | ZIP-based; HTML/XML content; requires dedicated extractor for chapter structure |
+| EML / MBOX | v0.2 | Planned alongside archive content extraction |
+| MSG (Outlook email) | v0.2 | Binary compound document; requires dedicated parser |
+| RTF | v0.2 | Common in Windows archives; naive extraction produces noisy text |
+| ODS / ODT / ODP (OpenDocument) | v0.2 | ZIP-based like OOXML |
+| XLSX text extraction | v0.2 | Metadata-only in v0.1 (see OOXML above) |
+| PPTX text extraction | v0.2 | Metadata-only in v0.1 (see OOXML above) |
+
+#### Explicitly Out-of-Scope
+
+The following formats produce `status=4` (unsupported format) or archive/binary skip. They are not on any current roadmap:
+
+- PST / OST (Outlook data files) — proprietary compound format
+- DWG / DXF (CAD files)
+- Proprietary creative-tool formats (`.psd`, `.ai`, `.sketch`, `.fig`) — indexed by path/metadata only
+- `.db`, `.sqlite` database files — not content-indexed (binary format; SQL dumps as `.sql` are indexed normally)
 
 ---
 
