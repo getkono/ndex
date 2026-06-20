@@ -2482,3 +2482,9 @@ Copy `.ndex/` back to its original location. `ndex-remote` runs WAL recovery on 
 #### Full Rebuild as Disaster Recovery
 
 The index is derived data — always rebuildable from source files via `ndex reindex`. Backup is a convenience optimization to avoid rebuild time, not a requirement for correctness.
+
+
+## TODOs
+
+- Plan out TUI that lets you use the index to search through content.
+- TUI should support rendering images and streaming over for preview (compress if needed, use rawshift if needed).
