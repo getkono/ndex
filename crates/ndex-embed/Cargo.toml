@@ -1,0 +1,24 @@
+[package]
+name = "ndex-embed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ndex embedding: ONNX inference (ort), tokenizer, model management"
+
+[lints]
+workspace = true
+
+[dependencies]
+ndex-core.workspace = true
+ort.workspace = true
+tokenizers.workspace = true
+half.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

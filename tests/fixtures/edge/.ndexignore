@@ -1,0 +1,3 @@
+# Example .ndexignore (gitignore-compatible syntax, PRD §11.1).
+*.secret
+**/credentials.json

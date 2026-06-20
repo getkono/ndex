@@ -1,0 +1,1 @@
+Hello, ndex. This is a plaintext fixture used by the extractor tests.
