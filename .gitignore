@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+
+# Index artifacts (never committed; always rebuildable from source files).
+.ndex/
+.ndex.old/
+
+# Embedding models and weights.
+/models/
+*.onnx
+
+# Local, per-developer overrides.
+hk.local.pkl
+.mise.local.toml
+
+# OS cruft.
+.DS_Store
+
+# NOTE: Cargo.lock IS committed (this workspace ships binaries).
