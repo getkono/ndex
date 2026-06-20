@@ -218,7 +218,6 @@ fn vector_index_add_search_save_load() {
 }
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn fts_index_add_commit_search() {
     use ndex_core::model::{BlockType, Chunk};
     use ndex_store::fts::FtsIndex;
