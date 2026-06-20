@@ -213,7 +213,6 @@ impl Embed for RecordingEmbed {
 }
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn embed_query_applies_asymmetric_prefix() {
     let fake = RecordingEmbed {
         seen: Mutex::new(vec![]),

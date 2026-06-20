@@ -44,8 +44,46 @@ pub fn run(
     limit: usize,
     offset: usize,
 ) -> Result<SearchOutcome> {
-    let _ = (store, embedder, query, requested, filters, limit, offset);
-    todo!()
+    // v0.1 retrieves via FTS; semantic/hybrid degrade to FTS while the vector index is absent
+    // (PRD §16.3). `embedder`/`filters` are reserved for the semantic + filtered-search follow-up.
+    let _ = (embedder, filters);
+    let vectors_empty = store.vectors.as_ref().is_none_or(|v| v.is_empty());
+    let mode = crate::mode::resolve(query, requested, vectors_empty);
+
+    let fetch = limit.saturating_add(offset).max(1);
+    let fts_hits = store
+        .fts
+        .search(query, fetch, store.config.search.title_boost)?;
+
+    let raw: Vec<f32> = fts_hits.iter().map(|h| h.score).collect();
+    let mut display = raw.clone();
+    crate::fuse::min_max_normalize(&mut display);
+
+    let all: Vec<Hit> = fts_hits
+        .iter()
+        .zip(&display)
+        .zip(&raw)
+        .map(|((h, &score), &score_raw)| Hit {
+            file_id: h.file_id,
+            chunk_ord: h.chunk_ord,
+            score,
+            score_raw,
+            score_fts: Some(score_raw),
+            score_vec: None,
+            byte_start: h.byte_start,
+            byte_end: h.byte_end,
+        })
+        .collect();
+
+    let total = all.len() as u64;
+    let hits: Vec<Hit> = all.into_iter().skip(offset).take(limit).collect();
+    let truncated = total > offset as u64 + hits.len() as u64;
+    Ok(SearchOutcome {
+        hits,
+        total,
+        mode,
+        truncated,
+    })
 }
 
 #[cfg(test)]
