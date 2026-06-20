@@ -133,7 +133,6 @@ fn walk_and_diff_outcomes_default_empty() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn walk_collects_regular_files_and_honors_ignores() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("keep.txt"), b"hello").unwrap();
@@ -151,31 +150,66 @@ fn walk_collects_regular_files_and_honors_ignores() {
 }
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn preflight_memory_accepts_small_estimates() {
     // A handful of files must never trip the 75%-RAM abort.
     preflight_memory(10).unwrap();
 }
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn preflight_disk_accepts_small_estimates() {
     let tmp = tempfile::tempdir().unwrap();
     preflight_disk(tmp.path(), 1024).unwrap();
 }
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn full_reconcile_indexes_a_tree() {
-    // Spec: open a store at a fresh root, reconcile a source tree, and report new-file counts.
+    // Create a fresh index at a source root, reconcile it, and report new/processed counts.
     // Exercises Store::create + Reconciler::run + walk/diff/process end to end.
+    use ndex_core::config::Config;
+    use ndex_core::identity::{
+        EmbeddingIdentity, FtsIdentity, Hashing, Identity, IndexIdentity, SCHEMA_VERSION,
+    };
     use ndex_core::progress::NullSink;
     use ndex_reconcile::Reconciler;
+    use ndex_store::Store;
 
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("a.txt"), b"alpha").unwrap();
-    let mut store = ndex_store::Store::open(tmp.path()).unwrap();
+    std::fs::write(tmp.path().join("a.txt"), b"alpha bravo charlie").unwrap();
+    std::fs::write(tmp.path().join("b.md"), b"# Notes\n\nsome words here").unwrap();
+
+    let identity = IndexIdentity {
+        identity: Identity {
+            schema_version: SCHEMA_VERSION,
+            created_by: "test".into(),
+            created_at: "2026-06-19T00:00:00Z".into(),
+        },
+        embedding: EmbeddingIdentity {
+            model_name: ndex_core::constants::DEFAULT_MODEL.into(),
+            model_hash: "test".into(),
+            dimensions: 768,
+            mrl_dimensions: 256,
+            vector_scalar: "f16".into(),
+            hnsw_m: 32,
+            hnsw_ef_construction: 200,
+        },
+        hashing: Hashing {
+            algorithm: "blake3".into(),
+        },
+        fts: FtsIdentity {
+            tokenizer_version: 1,
+        },
+    };
+
+    let mut store = Store::create(tmp.path(), identity, Config::default()).unwrap();
     let mut rec = Reconciler::new(&mut store, None);
     let stats = rec.run(&ReconcileOptions::default(), &NullSink).unwrap();
-    assert_eq!(stats.new, 1);
+    assert_eq!(stats.new, 2);
+    assert_eq!(stats.processed, 2);
+    assert_eq!(stats.failed, 0);
+
+    // A second reconcile sees no changes.
+    let mut rec = Reconciler::new(&mut store, None);
+    let again = rec.run(&ReconcileOptions::default(), &NullSink).unwrap();
+    assert_eq!(again.new, 0);
+    assert_eq!(again.unchanged, 2);
 }

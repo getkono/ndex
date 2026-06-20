@@ -324,6 +324,22 @@ impl Manifest {
                 other => Err(db_err(other)),
             })
     }
+
+    /// All non-deleted files as `(file_id, path)`, used by the Phase 2 diff to detect deletions.
+    pub fn live_files(&self) -> Result<Vec<(i64, NdexPath)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_id, path FROM files WHERE status != 3")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                let id: i64 = r.get(0)?;
+                let path: Vec<u8> = r.get(1)?;
+                Ok((id, NdexPath::new(path)))
+            })
+            .map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+    }
 }
 
 #[cfg(test)]

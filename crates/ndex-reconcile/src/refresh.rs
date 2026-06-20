@@ -3,7 +3,10 @@
 use std::time::Duration;
 
 use ndex_core::error::Result;
+use ndex_core::progress::NullSink;
 use ndex_store::Store;
+
+use crate::reconciler::{ReconcileOptions, Reconciler};
 
 /// Index staleness relative to the configured thresholds (PRD §6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,8 +42,18 @@ pub fn staleness(
 /// Run a time-boxed quick reconcile (Phase 1 + 2 + new-file Phase 3) under a non-blocking lock,
 /// skipping silently if another writer holds it (PRD §6.2).
 pub fn quick_reconcile(store: &mut Store, budget: Duration) -> Result<()> {
-    let _ = (store, budget);
-    todo!()
+    // v0.1 runs a new-files-only incremental pass; strict wall-clock time-boxing to `budget`
+    // (and query-prioritized ordering) is a follow-up (PRD §6.2).
+    let _ = budget;
+    let mut reconciler = Reconciler::new(store, None);
+    reconciler.run(
+        &ReconcileOptions {
+            only_new: true,
+            ..ReconcileOptions::default()
+        },
+        &NullSink,
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

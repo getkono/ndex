@@ -11,7 +11,7 @@ pub mod manifest;
 pub mod meta;
 pub mod vector;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ndex_core::constants::{CONFIG_TOML, CONTENT_DIR, INDEX_TOML, MANIFEST_DB, META_DB, NDEX_DIR};
 use ndex_core::error::{NdexError, Result};
@@ -33,6 +33,7 @@ pub struct Store {
     /// `None` when the index was created with `--model none` (PRD §13.4).
     pub vectors: Option<VectorIndex>,
     lock: IndexLock,
+    root: PathBuf,
 }
 
 impl Store {
@@ -67,6 +68,7 @@ impl Store {
             fts,
             vectors: None,
             lock,
+            root: root.to_path_buf(),
         })
     }
 
@@ -97,11 +99,17 @@ impl Store {
             fts,
             vectors: None,
             lock,
+            root: root.to_path_buf(),
         })
     }
 
     /// Borrow the held write lock (kept alive for the lifetime of the `Store`).
     pub fn lock(&self) -> &IndexLock {
         &self.lock
+    }
+
+    /// The archive root directory (the parent of `.ndex/`).
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 }
