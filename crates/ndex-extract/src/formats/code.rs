@@ -21,7 +21,11 @@ impl Extractor for CodeExtractor {
 /// Resolve a language name (from [`crate::mime::extension_language`] / shebang) to its bundled
 /// tree-sitter grammar (PRD §4.4 v0.1 grammar set). `None` ⇒ fall through to plaintext.
 pub fn language_for(lang: &str) -> Option<tree_sitter::Language> {
-    // TODO(skeleton): match lang → tree_sitter_rust::LANGUAGE.into(), tree_sitter_python::…, etc.
-    let _ = lang;
-    todo!()
+    let grammar = match lang {
+        "rust" => tree_sitter_rust::LANGUAGE,
+        "python" => tree_sitter_python::LANGUAGE,
+        "javascript" => tree_sitter_javascript::LANGUAGE,
+        _ => return None,
+    };
+    Some(grammar.into())
 }

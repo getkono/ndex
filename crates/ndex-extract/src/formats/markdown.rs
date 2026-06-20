@@ -12,7 +12,8 @@ pub struct MarkdownExtractor;
 
 impl Extractor for MarkdownExtractor {
     fn extract(&self, bytes: &[u8], ctx: &ExtractCtx<'_>) -> Result<Extraction> {
-        let _ = (bytes, ctx);
-        todo!()
+        // v0.1 indexes Markdown as text (fully FTS-searchable); structured heading/code-block
+        // extraction via pulldown-cmark is a follow-up refinement (PRD §4.5).
+        crate::formats::text::text_extraction(bytes, ctx)
     }
 }
