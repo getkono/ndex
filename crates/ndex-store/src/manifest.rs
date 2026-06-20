@@ -6,7 +6,7 @@ use ndex_core::error::{NdexError, Result};
 use ndex_core::model::{FileRecord, WalkEntry};
 use ndex_core::path::NdexPath;
 use ndex_core::status::FileStatus;
-use rusqlite::{Connection, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 /// Map a rusqlite error into the crate error type (the engine-error family, exit code 1).
 fn db_err(e: rusqlite::Error) -> NdexError {
@@ -339,6 +339,18 @@ impl Manifest {
             })
             .map_err(db_err)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+    }
+
+    /// The path for a `file_id`, used to render search hits.
+    pub fn path_of(&self, file_id: i64) -> Result<Option<NdexPath>> {
+        self.conn
+            .query_row(
+                "SELECT path FROM files WHERE file_id = ?1",
+                params![file_id],
+                |r| r.get::<_, Vec<u8>>(0).map(NdexPath::new),
+            )
+            .optional()
+            .map_err(db_err)
     }
 }
 
