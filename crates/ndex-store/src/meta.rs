@@ -2,8 +2,14 @@
 
 use std::path::Path;
 
-use ndex_core::error::Result;
+use ndex_core::error::{NdexError, Result};
 use ndex_core::model::{ArchiveMeta, DocMeta, MediaMeta};
+use rusqlite::{Connection, OptionalExtension, Row, params};
+
+/// Map a rusqlite error into the crate error type.
+fn db_err(e: rusqlite::Error) -> NdexError {
+    NdexError::Index(e.to_string())
+}
 
 /// Connection pragmas (same as the manifest, PRD §10.4).
 pub const META_PRAGMAS: &str = "\
@@ -79,11 +85,50 @@ pub struct MetaDb {
     conn: rusqlite::Connection,
 }
 
+fn row_to_doc(row: &Row<'_>) -> rusqlite::Result<DocMeta> {
+    Ok(DocMeta {
+        title: row.get("title")?,
+        author: row.get("author")?,
+        subject: row.get("subject")?,
+        creator: row.get("creator")?,
+        producer: row.get("producer")?,
+        created_at: row.get("created_at")?,
+        modified_at: row.get("modified_at")?,
+        page_count: row.get::<_, Option<i64>>("page_count")?.map(|v| v as u32),
+        word_count: row.get::<_, Option<i64>>("word_count")?.map(|v| v as u32),
+        lang: row.get("lang")?,
+    })
+}
+
+fn row_to_media(row: &Row<'_>) -> rusqlite::Result<MediaMeta> {
+    Ok(MediaMeta {
+        width: row.get::<_, Option<i64>>("width")?.map(|v| v as u32),
+        height: row.get::<_, Option<i64>>("height")?.map(|v| v as u32),
+        duration_ms: row.get::<_, Option<i64>>("duration_ms")?.map(|v| v as u64),
+        codec: row.get("codec")?,
+        bitrate: row.get::<_, Option<i64>>("bitrate")?.map(|v| v as u32),
+        fps: row.get::<_, Option<f64>>("fps")?.map(|v| v as f32),
+        camera_make: row.get("camera_make")?,
+        camera_model: row.get("camera_model")?,
+        lens: row.get("lens")?,
+        iso: row.get::<_, Option<i64>>("iso")?.map(|v| v as u32),
+        focal_length: row.get::<_, Option<f64>>("focal_length")?.map(|v| v as f32),
+        aperture: row.get::<_, Option<f64>>("aperture")?.map(|v| v as f32),
+        shutter_speed: row.get("shutter_speed")?,
+        gps_lat: row.get("gps_lat")?,
+        gps_lon: row.get("gps_lon")?,
+        gps_alt: row.get("gps_alt")?,
+        taken_at: row.get("taken_at")?,
+    })
+}
+
 impl MetaDb {
     /// Open (creating if absent) the metadata database, applying pragmas + schema.
     pub fn open_or_create(path: &Path) -> Result<Self> {
-        let _ = path;
-        todo!("open meta.db, apply META_PRAGMAS + META_SCHEMA")
+        let conn = Connection::open(path).map_err(db_err)?;
+        conn.execute_batch(META_PRAGMAS).map_err(db_err)?;
+        conn.execute_batch(META_SCHEMA).map_err(db_err)?;
+        Ok(Self { conn })
     }
 
     /// Borrow the underlying connection.
@@ -93,38 +138,120 @@ impl MetaDb {
 
     /// Upsert a `doc_meta` row for a file.
     pub fn upsert_doc_meta(&self, file_id: i64, meta: &DocMeta) -> Result<()> {
-        let _ = (file_id, meta);
-        todo!()
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO doc_meta \
+                   (file_id, title, author, subject, creator, producer, created_at, \
+                    modified_at, page_count, word_count, lang) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    file_id,
+                    meta.title,
+                    meta.author,
+                    meta.subject,
+                    meta.creator,
+                    meta.producer,
+                    meta.created_at,
+                    meta.modified_at,
+                    meta.page_count.map(i64::from),
+                    meta.word_count.map(i64::from),
+                    meta.lang,
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
     }
 
     /// Upsert a `media_meta` row for a file.
     pub fn upsert_media_meta(&self, file_id: i64, meta: &MediaMeta) -> Result<()> {
-        let _ = (file_id, meta);
-        todo!()
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO media_meta \
+                   (file_id, width, height, duration_ms, codec, bitrate, fps, camera_make, \
+                    camera_model, lens, iso, focal_length, aperture, shutter_speed, \
+                    gps_lat, gps_lon, gps_alt, taken_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                         ?15, ?16, ?17, ?18)",
+                params![
+                    file_id,
+                    meta.width.map(i64::from),
+                    meta.height.map(i64::from),
+                    meta.duration_ms.map(|v| v as i64),
+                    meta.codec,
+                    meta.bitrate.map(i64::from),
+                    meta.fps.map(f64::from),
+                    meta.camera_make,
+                    meta.camera_model,
+                    meta.lens,
+                    meta.iso.map(i64::from),
+                    meta.focal_length.map(f64::from),
+                    meta.aperture.map(f64::from),
+                    meta.shutter_speed,
+                    meta.gps_lat,
+                    meta.gps_lon,
+                    meta.gps_alt,
+                    meta.taken_at,
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
     }
 
     /// Upsert an `archive_meta` row for a file.
     pub fn upsert_archive_meta(&self, file_id: i64, meta: &ArchiveMeta) -> Result<()> {
-        let _ = (file_id, meta);
-        todo!()
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO archive_meta \
+                   (file_id, member_count, total_size, format, extraction_status) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    file_id,
+                    meta.member_count.map(i64::from),
+                    meta.total_size.map(|v| v as i64),
+                    meta.format,
+                    meta.extraction_status,
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(())
     }
 
     /// Read a file's document metadata, if any.
     pub fn doc_meta(&self, file_id: i64) -> Result<Option<DocMeta>> {
-        let _ = file_id;
-        todo!()
+        self.conn
+            .query_row(
+                "SELECT * FROM doc_meta WHERE file_id = ?1",
+                params![file_id],
+                row_to_doc,
+            )
+            .optional()
+            .map_err(db_err)
     }
 
     /// Read a file's media metadata, if any.
     pub fn media_meta(&self, file_id: i64) -> Result<Option<MediaMeta>> {
-        let _ = file_id;
-        todo!()
+        self.conn
+            .query_row(
+                "SELECT * FROM media_meta WHERE file_id = ?1",
+                params![file_id],
+                row_to_media,
+            )
+            .optional()
+            .map_err(db_err)
     }
 
     /// Delete all metadata rows for a file (used by `delete` / re-index, PRD §13.8).
     pub fn delete_file(&self, file_id: i64) -> Result<()> {
-        let _ = file_id;
-        todo!()
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        for table in ["doc_meta", "media_meta", "archive_meta", "file_tags"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE file_id = ?1"),
+                params![file_id],
+            )
+            .map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
     }
 }
 

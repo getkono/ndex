@@ -165,7 +165,6 @@ fn walk_entry() -> WalkEntry {
 }
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn manifest_upsert_classify_and_status_lifecycle() {
     let tmp = tempfile::tempdir().unwrap();
     let manifest = Manifest::open_or_create(&tmp.path().join("manifest.db")).unwrap();
@@ -188,7 +187,6 @@ fn manifest_upsert_classify_and_status_lifecycle() {
 }
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn meta_db_roundtrips_doc_meta() {
     let tmp = tempfile::tempdir().unwrap();
     let meta = MetaDb::open_or_create(&tmp.path().join("meta.db")).unwrap();
@@ -247,7 +245,6 @@ fn fts_index_add_commit_search() {
 }
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn lock_is_exclusive() {
     let tmp = tempfile::tempdir().unwrap();
     let _held = ndex_store::lock::IndexLock::acquire(tmp.path()).unwrap();
