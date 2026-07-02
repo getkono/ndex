@@ -44,9 +44,36 @@ pub fn strip_bom(bytes: &[u8]) -> &[u8] {
 /// Decode arbitrary bytes to UTF-8: BOM → `chardetng` detection → `encoding_rs` transcode →
 /// lossy fallback (PRD §4.8). The caller typically follows with [`nfc_normalize`].
 pub fn decode_to_utf8(bytes: &[u8]) -> Cow<'_, str> {
-    // TODO(skeleton): UTF-16 transcode by BOM, else chardetng-detect + encoding_rs, else lossy.
-    let _ = bytes;
-    todo!()
+    match detect_bom(bytes) {
+        Some(Bom::Utf16Le) => return Cow::Owned(decode_utf16(&bytes[2..], true)),
+        Some(Bom::Utf16Be) => return Cow::Owned(decode_utf16(&bytes[2..], false)),
+        Some(Bom::Utf8) => return Cow::Owned(String::from_utf8_lossy(&bytes[3..]).into_owned()),
+        None => {}
+    }
+    // Fast path: the bytes are already valid UTF-8.
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return Cow::Borrowed(s);
+    }
+    // Detect a legacy encoding and transcode to UTF-8 (lossy on undecodable bytes).
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Deny);
+    detector.feed(bytes, true);
+    let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
+    Cow::Owned(encoding.decode(bytes).0.into_owned())
+}
+
+/// Decode a UTF-16 byte body (BOM already stripped) into a `String`, replacing unpaired
+/// surrogates with `U+FFFD`.
+fn decode_utf16(body: &[u8], little_endian: bool) -> String {
+    let units = body.chunks_exact(2).map(|c| {
+        if little_endian {
+            u16::from_le_bytes([c[0], c[1]])
+        } else {
+            u16::from_be_bytes([c[0], c[1]])
+        }
+    });
+    char::decode_utf16(units)
+        .map(|r| r.unwrap_or('\u{FFFD}'))
+        .collect()
 }
 
 /// NFC-normalize text before tokenization so NFC/NFD spellings match (PRD §10.2).

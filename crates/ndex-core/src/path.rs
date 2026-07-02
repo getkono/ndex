@@ -58,8 +58,32 @@ impl NdexPath {
     /// JSON-safe rendering: valid UTF-8 passes through; invalid bytes are `\uXXXX`-escaped
     /// (PRD §8). Used by the client's JSON output renderer.
     pub fn to_json_escaped(&self) -> String {
-        // TODO(skeleton): implement the byte-preserving \uXXXX escaping policy (PRD §8).
-        todo!("byte-preserving JSON escaping for non-UTF-8 paths")
+        use std::fmt::Write as _;
+
+        let mut out = String::with_capacity(self.0.len());
+        // `utf8_chunks` walks valid UTF-8 runs and the invalid byte runs between them, so we
+        // preserve every byte: valid text is JSON-escaped, invalid bytes become `\u00XX`.
+        for chunk in self.0.utf8_chunks() {
+            for c in chunk.valid().chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    '\u{08}' => out.push_str("\\b"),
+                    '\u{0c}' => out.push_str("\\f"),
+                    c if (c as u32) < 0x20 => {
+                        let _ = write!(out, "\\u{:04x}", c as u32);
+                    }
+                    c => out.push(c),
+                }
+            }
+            for &b in chunk.invalid() {
+                let _ = write!(out, "\\u{:04x}", b);
+            }
+        }
+        out
     }
 }
 

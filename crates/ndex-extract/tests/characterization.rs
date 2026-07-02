@@ -214,7 +214,6 @@ fn json_variant_by_first_nonws_byte() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn decode_to_utf8_handles_utf16_and_passthrough() {
     assert_eq!(encoding::decode_to_utf8(b"hello"), "hello");
     let utf16le = [0xFF, 0xFE, b'h', 0x00, b'i', 0x00];
@@ -222,7 +221,6 @@ fn decode_to_utf8_handles_utf16_and_passthrough() {
 }
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn plaintext_extractor_yields_blocks() {
     let cfg = Config::default();
     let path = p("/x/notes.txt");
@@ -241,7 +239,6 @@ fn plaintext_extractor_yields_blocks() {
 }
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn chunker_produces_ordered_chunks_for_the_file() {
     let ws = Whitespace;
     let chunking = Chunking::default();
@@ -263,7 +260,6 @@ fn chunker_produces_ordered_chunks_for_the_file() {
 }
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn language_for_maps_bundled_grammars() {
     assert!(language_for("rust").is_some());
     assert!(language_for("python").is_some());

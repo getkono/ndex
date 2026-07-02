@@ -10,8 +10,10 @@ exposes full-text **and** semantic search over SSH:
 ndex search nas:/pool/archive "quarterly earnings"
 ```
 
-> **Status:** v0.1 skeleton. Interfaces, types, schemas, and tooling are finalized;
-> product-logic bodies are `todo!()`. See [`PRD.md`](PRD.md) for the full design.
+> **Status:** v0.1 in progress. The **local pipeline works end to end** — `ndex-remote`
+> can `init` → `index` → `search` a directory (SQLite manifest + tantivy full-text search).
+> Semantic embeddings, exotic format extractors, and the SSH thin-client transport are the
+> next increments. See [`docs/END_TO_END.md`](docs/END_TO_END.md) and [`PRD.md`](PRD.md).
 
 ## Architecture
 
@@ -32,6 +34,23 @@ ndex-core ← ndex-protocol
    │                                            ↑
    ndex(client) ──────── ndex-remote(server) ───┘
 ```
+
+## Try it (works today)
+
+```sh
+cargo build -p ndex-remote
+BIN=target/debug/ndex-remote
+
+$BIN init   /path/to/archive                  # create /path/to/archive/.ndex
+$BIN index  /path/to/archive                  # walk → diff → extract → FTS index
+$BIN search /path/to/archive "quarterly earnings"
+$BIN search /path/to/archive blake3 --format paths
+$BIN stats  /path/to/archive
+```
+
+The SSH thin-client form (`ndex search nas:/pool "…"`) is wired in a later increment; for now
+run `ndex-remote` on the host that holds the data. Full walkthrough:
+[`docs/END_TO_END.md`](docs/END_TO_END.md).
 
 ## Quick start (development)
 
@@ -57,7 +76,9 @@ mise run ci                       # fmt-check + lint + clippy + test
 | `config` | View configuration |
 | `completions` | Shell completions |
 
-`tag`, `dedup`, and `compact` are compiled stubs (planned for v0.2).
+`init`, `index`, `search`, `info`, and `stats` are implemented (standalone `ndex-remote`).
+`verify`, `delete`, `config`, and `reindex` are in progress; `tag`, `dedup`, and `compact`
+are compiled stubs (planned for v0.2). See [`docs/END_TO_END.md`](docs/END_TO_END.md) for status.
 
 ## License
 

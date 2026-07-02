@@ -303,7 +303,6 @@ fn ndexpath_os_str_roundtrip_preserves_invalid_bytes() {
 }
 
 #[test]
-#[ignore = "impl pending: PR #3"]
 fn ndexpath_json_escaping_contract() {
     // PRD §8: byte-preserving JSON escaping. ASCII passes through; bytes that are not valid
     // UTF-8 are emitted as `\u00XX` (lowercase hex) so the rendering is reversible.

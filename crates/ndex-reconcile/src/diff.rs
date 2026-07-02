@@ -2,7 +2,7 @@
 
 use ndex_core::error::Result;
 use ndex_core::path::NdexPath;
-use ndex_store::Manifest;
+use ndex_store::{Change, Manifest};
 
 use crate::walk::WalkOutcome;
 
@@ -22,6 +22,30 @@ pub struct DiffOutcome {
 /// Classify walked entries against the manifest, tracking hard links by `(dev, inode)` so
 /// duplicate inodes share a canonical `file_id` (PRD §11.1). Parallelized with rayon.
 pub fn diff(manifest: &Manifest, walk: &WalkOutcome) -> Result<DiffOutcome> {
-    let _ = (manifest, walk);
-    todo!()
+    let mut out = DiffOutcome::default();
+
+    for entry in &walk.files {
+        match manifest.classify(entry.key(), entry.value())? {
+            Change::New => out.new.push(entry.key().clone()),
+            Change::Modified => out.modified.push(entry.key().clone()),
+            Change::Unchanged => out.unchanged += 1,
+            Change::Deleted => {}
+        }
+    }
+
+    // Files present in the manifest but no longer on disk are deletions.
+    for (file_id, path) in manifest.live_files()? {
+        if !walk.files.contains_key(&path) {
+            out.deleted.push(file_id);
+        }
+    }
+
+    tracing::debug!(
+        new = out.new.len(),
+        modified = out.modified.len(),
+        deleted = out.deleted.len(),
+        unchanged = out.unchanged,
+        "diff complete"
+    );
+    Ok(out)
 }
