@@ -1,0 +1,21 @@
+[package]
+name = "ndex-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ndex IPC: MessagePack wire messages, framing, handshake"
+
+[lints]
+workspace = true
+
+[dependencies]
+ndex-core.workspace = true
+serde.workspace = true
+rmp-serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

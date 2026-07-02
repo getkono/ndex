@@ -1,0 +1,59 @@
+# mise — dev tool + task manager (https://mise.jdx.dev).
+# Rust is intentionally absent: rustup + rust-toolchain.toml stay authoritative.
+# Bootstrap:  mise trust && mise install && mise run hooks-install
+
+[tools]
+# Prebuilt binaries via the aqua-backed registry shortnames.
+taplo = "latest"        # TOML formatter/linter
+typos = "latest"        # spell checker
+actionlint = "latest"   # GitHub Actions linter
+pkl = "latest"          # Apple Pkl CLI (evaluates hk.pkl)
+hk = "latest"           # git hook manager
+# cargo-backed tools (cargo-binstall fetches prebuilt binaries when available).
+"cargo:cargo-nextest" = "latest"
+"cargo:cargo-deny" = "latest"
+
+[env]
+# Wrap git hooks with `mise x` so hk-invoked tools resolve even without shell activation.
+HK_MISE = "1"
+
+[tasks.build]
+description = "Build the workspace (all targets)"
+run = "cargo build --workspace --all-targets"
+
+[tasks.test]
+description = "Run the test suite with nextest"
+run = "cargo nextest run --workspace"
+
+[tasks.check]
+description = "Type-check without producing artifacts"
+run = "cargo check --workspace --all-targets"
+
+[tasks.clippy]
+description = "Lint with clippy (warnings = errors)"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
+[tasks.fmt]
+description = "Format Rust + TOML in place"
+run = ["cargo fmt --all", "taplo fmt"]
+
+[tasks.fmt-check]
+description = "Verify formatting without writing (CI-safe)"
+run = ["cargo fmt --all --check", "taplo fmt --check"]
+
+[tasks.lint]
+description = "Spelling, workflow, and supply-chain checks"
+run = ["typos", "actionlint", "cargo deny check"]
+
+[tasks.doc]
+description = "Build API docs"
+run = "cargo doc --workspace --no-deps"
+
+[tasks.hooks-install]
+alias = "hooks"
+description = "Install hk git hooks for this repo"
+run = "hk install"
+
+[tasks.ci]
+description = "Full local CI: format-check, lint, clippy, test"
+depends = ["fmt-check", "lint", "clippy", "test"]

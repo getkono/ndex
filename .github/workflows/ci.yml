@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native build deps (usearch C++/cmake, rusqlite cc, tree-sitter, ort→openssl)
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev libssl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+
+      - name: Install dev tools (taplo, typos, actionlint, nextest, deny, hk, pkl)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: mise run fmt-check
+
+      - name: Clippy
+        run: mise run clippy
+
+      - name: Build
+        run: mise run build
+
+      - name: Test
+        run: mise run test
+
+      - name: Supply-chain & spelling
+        run: mise run lint

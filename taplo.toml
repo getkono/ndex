@@ -1,0 +1,6 @@
+# taplo — TOML formatter/linter (https://taplo.tamasfe.dev).
+[formatting]
+align_entries = false
+column_width = 100
+indent_string = "    "
+reorder_keys = false

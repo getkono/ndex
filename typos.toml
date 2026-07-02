@@ -1,0 +1,17 @@
+# typos — source spell checker (https://github.com/crate-ci/typos).
+[files]
+extend-exclude = ["tests/fixtures/**", "*.onnx", "Cargo.lock"]
+
+[default.extend-words]
+# Domain vocabulary that must not be "corrected".
+ndex = "ndex"
+arctic = "arctic"
+restat = "restat"  # re-running stat() (TOCTOU guard, reconcile process)
+flate = "flate"    # the flate2 compression crate
+caf = "caf"         # fragment of "café" in NFC normalization test data
+
+[default.extend-identifiers]
+# Crate/identifier names that resemble typos.
+blake3 = "blake3"
+usearch = "usearch"
+tantivy = "tantivy"

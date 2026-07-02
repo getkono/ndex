@@ -1,0 +1,23 @@
+[package]
+name = "ndex-search"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ndex search: mode heuristics, query building, RRF fusion, scoring"
+
+[lints]
+workspace = true
+
+[dependencies]
+ndex-core.workspace = true
+ndex-store.workspace = true
+ndex-embed.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rstest.workspace = true

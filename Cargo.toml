@@ -1,0 +1,135 @@
+# ndex — offline deep file indexer for archival storage.
+# Workspace root. Rust itself is owned by rustup (see rust-toolchain.toml);
+# mise manages only the auxiliary dev tools (taplo, typos, hk, nextest, deny).
+[workspace]
+resolver = "3"
+members = [
+    "crates/ndex-core",
+    "crates/ndex-protocol",
+    "crates/ndex-store",
+    "crates/ndex-extract",
+    "crates/ndex-embed",
+    "crates/ndex-search",
+    "crates/ndex-reconcile",
+    "crates/ndex-remote",
+    "crates/ndex",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"   # dependency floor (ort/tantivy/zip/pdf_oxide require ≥1.88); edition 2024 needs ≥1.85
+license = "MIT"
+authors = ["Justin Chung"]
+repository = "https://github.com/justy/ndex"
+description = "Offline deep file indexer for archival storage"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+# TODO(skeleton): remove the two `allow`s below once todo!() bodies are filled in.
+# They let real field/parameter names coexist with stub bodies under `clippy -D warnings`.
+dead_code = "allow"
+unused_variables = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+# --- internal crates ---
+ndex-core = { path = "crates/ndex-core" }
+ndex-protocol = { path = "crates/ndex-protocol" }
+ndex-store = { path = "crates/ndex-store" }
+ndex-extract = { path = "crates/ndex-extract" }
+ndex-embed = { path = "crates/ndex-embed" }
+ndex-search = { path = "crates/ndex-search" }
+ndex-reconcile = { path = "crates/ndex-reconcile" }
+
+# --- foundation ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1.3"
+toml = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+jiff = { version = "0.2", features = ["serde"] }
+half = { version = "2", features = ["serde", "std"] }
+blake3 = { version = "1", features = ["rayon", "mmap"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# --- cli / terminal (client) ---
+clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4.6"
+indicatif = "0.18"
+supports-color = "3"
+supports-hyperlinks = "3"
+terminal_size = "0.4"
+anstream = "1"
+anstyle = "1"
+
+# --- concurrency / fs ---
+rayon = "1"
+crossbeam-channel = "0.5"
+dashmap = "6"
+ignore = "0.4"
+memmap2 = "0.9"
+rustix = { version = "1", features = ["fs", "system"] }
+
+# --- index engines (CI needs cc + cmake + C++) ---
+rusqlite = { version = "0.40", features = ["bundled", "blob"] }
+tantivy = "0.26"
+usearch = "2.25"
+
+# --- embedding ---
+# `load-dynamic`: ONNX Runtime is dlopen'd at runtime, not linked at build.
+# NOTE: default features must stay ON — disabling them makes ort-sys emit a truncated OrtApi
+# that fails to compile ort's execution-provider modules (observed on rc.12).
+ort = { version = "=2.0.0-rc.12", features = ["load-dynamic"] }
+tokenizers = "0.23"
+
+# --- extraction ---
+infer = "0.19"
+mime_guess = "2"
+encoding_rs = "0.8"
+chardetng = "1"
+whatlang = "0.18"
+unicode-normalization = "0.1"
+unicode-segmentation = "1"
+pulldown-cmark = "0.13"
+docx-rust = "0.1"                 # DOCX reading (paragraph styles, headings, tables)
+lol_html = "3"
+scraper = "0.27"
+kamadak-exif = "0.6"               # import path is `exif`
+image = "0.25"
+pdf_oxide = "0.3"                  # primary PDF text extractor (immature; behind Extractor trait)
+pdfium-render = "0.9"             # optional fallback, gated by the `pdfium` feature
+# tree-sitter: pin the 0.25.x line; grammars trail core. Representative v0.1 subset;
+# TODO(skeleton): add the rest of the §4.4 grammar set (ts/tsx, c/cpp, go, java, ruby, ...).
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+
+# --- archives ---
+zip = "8"
+tar = "0.4"
+flate2 = "1"
+bzip2 = "0.6"
+liblzma = { version = "0.4", features = ["static"] }   # maintained xz2 successor
+
+# --- dev / test ---
+insta = "1"
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+proptest = "1"
+rstest = "0.26"
+criterion = "0.8"
+
+# Thin release profile knobs; tune for distribution later.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

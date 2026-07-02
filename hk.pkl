@@ -1,0 +1,73 @@
+/// hk.pkl — git hook config (https://hk.jdx.dev). Evaluated by the `pkl` CLI (installed via mise).
+/// Pinned to hk v1.48.0. Install hooks with `hk install` (or `mise run hooks-install`).
+/// Validate with `hk validate` after `mise install`.
+amends "package://github.com/jdx/hk/releases/download/v1.48.0/hk@1.48.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.48.0/hk@1.48.0#/Builtins.pkl"
+
+// Run steps in parallel (0 = auto-detect from CPU count).
+jobs = 0
+
+// Shared linters, splatted into each hook below. cargo tools run through mise
+// via `prefix = "mise exec --"`; HK_MISE=1 (mise.toml) also wraps the hooks.
+local linters = new Mapping<String, Step> {
+  ["cargo-fmt"] = (Builtins.cargo_fmt) {
+    prefix = "mise exec --"
+    workspace_indicator = "Cargo.toml"
+  }
+  ["taplo"] = (Builtins.taplo_format) {
+    prefix = "mise exec --"
+  }
+  ["typos"] = (Builtins.typos) {
+    prefix = "mise exec --"
+  }
+  ["actionlint"] = (Builtins.actionlint) {
+    prefix = "mise exec --"
+  }
+}
+
+hooks {
+  // FIX mode: auto-format and re-stage before the commit is created.
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    stage = true
+    fail_fast = true
+    steps {
+      ...linters
+    }
+  }
+
+  // CHECK mode on push: read-only verification + strict clippy + the test suite.
+  ["pre-push"] {
+    fix = false
+    steps {
+      ...linters
+      ["clippy"] {
+        glob = List("**/*.rs")
+        workspace_indicator = "Cargo.toml"
+        check = "mise exec -- cargo clippy --workspace --all-targets --all-features -- -D warnings"
+      }
+      ["test"] {
+        exclusive = true
+        check = "mise exec -- cargo nextest run --workspace"
+      }
+    }
+  }
+
+  // `hk fix` entrypoint (manual): apply every fixer, no stashing.
+  ["fix"] {
+    fix = true
+    stash = "none"
+    steps {
+      ...linters
+    }
+  }
+
+  // `hk check` entrypoint (manual / CI): read-only, run everything.
+  ["check"] {
+    fix = false
+    steps {
+      ...linters
+    }
+  }
+}

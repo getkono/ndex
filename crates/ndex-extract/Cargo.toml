@@ -1,0 +1,52 @@
+[package]
+name = "ndex-extract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "ndex format extraction: MIME routing, extractors, chunking, archive safety"
+
+[features]
+default = []
+# Optional PDF fallback that requires the native pdfium shared library.
+pdfium = ["dep:pdfium-render"]
+
+[lints]
+workspace = true
+
+[dependencies]
+ndex-core.workspace = true
+infer.workspace = true
+mime_guess.workspace = true
+encoding_rs.workspace = true
+chardetng.workspace = true
+whatlang.workspace = true
+unicode-normalization.workspace = true
+unicode-segmentation.workspace = true
+pulldown-cmark.workspace = true
+docx-rust.workspace = true
+lol_html.workspace = true
+scraper.workspace = true
+kamadak-exif.workspace = true
+image.workspace = true
+pdf_oxide.workspace = true
+pdfium-render = { workspace = true, optional = true }
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-javascript.workspace = true
+zip.workspace = true
+tar.workspace = true
+flate2.workspace = true
+bzip2.workspace = true
+liblzma.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rstest.workspace = true
+insta.workspace = true
