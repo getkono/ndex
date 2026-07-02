@@ -51,8 +51,17 @@ pub struct FtsIdentity {
 
 impl IndexIdentity {
     /// Load `index.toml`.
+    ///
+    /// A missing file is [`NdexError::IndexNotFound`] (exit 3); other I/O failures stay
+    /// [`NdexError::Io`]; malformed TOML is [`NdexError::Config`].
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                NdexError::IndexNotFound(path.display().to_string())
+            } else {
+                NdexError::Io(e)
+            }
+        })?;
         toml::from_str(&text).map_err(|e| NdexError::Config(e.to_string()))
     }
 

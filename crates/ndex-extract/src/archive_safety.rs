@@ -14,12 +14,12 @@ pub fn member_path(archive: &NdexPath, member: &str) -> NdexPath {
     NdexPath::new(bytes)
 }
 
-/// Reject unsafe archive member paths: traversal (`../`), absolute, or containing NUL (PRD §4.9).
+/// Reject unsafe archive member paths: absolute, containing a `..` traversal component
+/// (`/`- or `\`-separated, including bare/leading/trailing `..`), or containing NUL (PRD §4.9).
 pub fn is_unsafe_member_path(member: &str) -> bool {
     member.starts_with('/')
-        || member.contains("../")
-        || member.contains("..\\")
         || member.contains('\0')
+        || member.split(['/', '\\']).any(|component| component == "..")
 }
 
 /// Whether a member's decompressed:compressed ratio exceeds the bomb `limit` (PRD §4.9).
@@ -44,7 +44,16 @@ mod tests {
         assert!(is_unsafe_member_path("../../etc/passwd"));
         assert!(is_unsafe_member_path("/etc/passwd"));
         assert!(is_unsafe_member_path("a\0b"));
+        assert!(is_unsafe_member_path("dir\\..\\x"));
+        // Bare `..` components, not just `../` substrings.
+        assert!(is_unsafe_member_path(".."));
+        assert!(is_unsafe_member_path("foo/.."));
+        assert!(is_unsafe_member_path("foo/../bar"));
         assert!(!is_unsafe_member_path("2024/Q3-report.pdf"));
+        // `..` inside a name is not a traversal component.
+        assert!(!is_unsafe_member_path("notes..txt"));
+        assert!(!is_unsafe_member_path("..hidden/file"));
+        assert!(!is_unsafe_member_path("a/..b/c"));
     }
 
     #[test]

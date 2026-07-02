@@ -1,4 +1,7 @@
 # taplo — TOML formatter/linter (https://taplo.tamasfe.dev).
+# Build artifacts contain generated Cargo.tomls; never format them.
+exclude = ["target/**"]
+
 [formatting]
 align_entries = false
 column_width = 100

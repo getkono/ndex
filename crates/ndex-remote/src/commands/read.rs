@@ -20,7 +20,7 @@ fn parse_mode(s: &str) -> SearchMode {
 
 /// `ndex-remote search` (PRD §13.2).
 pub fn search(args: SearchArgs) -> Result<()> {
-    let store = Store::open(&args.path)?;
+    let store = Store::open_read(&args.path)?;
     let filters = SearchFilters::default();
     let outcome = ndex_search::run(
         &store,
@@ -31,6 +31,12 @@ pub fn search(args: SearchArgs) -> Result<()> {
         args.limit as usize,
         args.offset as usize,
     )?;
+
+    // Degradation warnings from mode resolution (owned by ndex-search) go to stderr so
+    // stdout stays clean for piping.
+    for warning in &outcome.warnings {
+        eprintln!("warning: {warning}");
+    }
 
     if outcome.hits.is_empty() {
         eprintln!("No results.");
@@ -74,7 +80,7 @@ fn render_snippet(snippet: &str) -> String {
 
 /// `ndex-remote info` (PRD §13.5).
 pub fn info(args: InfoArgs) -> Result<()> {
-    let store = Store::open(&args.path)?;
+    let store = Store::open_read(&args.path)?;
     let target = NdexPath::from_os_str(args.file.as_os_str());
     let record = store
         .manifest
@@ -90,7 +96,7 @@ pub fn info(args: InfoArgs) -> Result<()> {
 
 /// `ndex-remote stats` (PRD §13.5).
 pub fn stats(args: PathArg) -> Result<()> {
-    let store = Store::open(&args.path)?;
+    let store = Store::open_read(&args.path)?;
     let files = store.manifest.live_files()?.len();
     println!("index:  {}/.ndex", args.path.display());
     println!("model:  {}", store.identity.embedding.model_name);

@@ -1,6 +1,6 @@
 # rustup owns the Rust toolchain (mise intentionally does NOT manage Rust).
 # This file is the single source of truth for the compiler version.
 [toolchain]
-channel = "1.96.0"            # edition 2024 requires >= 1.85
+channel = "1.96.0"                 # edition 2024 requires >= 1.85
 components = ["rustfmt", "clippy"]
 profile = "minimal"

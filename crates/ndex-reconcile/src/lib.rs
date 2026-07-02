@@ -14,7 +14,7 @@ pub mod refresh;
 pub mod walk;
 
 pub use diff::{DiffOutcome, diff};
-pub use process::{classify_io_error, process, restat_unchanged};
+pub use process::{BATCH_COMMIT_FILES, classify_io_error, process, restat_unchanged};
 pub use reconciler::{ReconcileOptions, ReconcileStats, Reconciler};
 pub use recover::recover;
 pub use refresh::{Staleness, quick_reconcile, staleness};

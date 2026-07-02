@@ -15,4 +15,4 @@ pub mod lang;
 pub mod mime;
 
 pub use chunk::Chunker;
-pub use extractor::{ExtractCtx, Extraction, Extractor, router};
+pub use extractor::{ExtractCtx, Extraction, Extractor, Route, router};

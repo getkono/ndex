@@ -12,11 +12,15 @@ fn db_err(e: rusqlite::Error) -> NdexError {
 }
 
 /// Connection pragmas (same as the manifest, PRD §10.4).
+///
+/// `foreign_keys` is connection-local in SQLite (default off), so it must be enabled on
+/// every open; within meta.db it enforces `file_tags.tag_id REFERENCES tags(tag_id)`.
 pub const META_PRAGMAS: &str = "\
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA cache_size = -262144;
 PRAGMA mmap_size = 1073741824;
+PRAGMA foreign_keys = ON;
 ";
 
 /// Table DDL for the metadata database (PRD §10.4).

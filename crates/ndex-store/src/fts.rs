@@ -4,7 +4,7 @@ use std::path::Path;
 
 use ndex_core::error::{NdexError, Result};
 use ndex_core::model::Chunk;
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, TopDocs};
 use tantivy::directory::MmapDirectory;
 use tantivy::query::QueryParser;
 use tantivy::schema::{FAST, Field, INDEXED, STORED, STRING, Schema, TEXT, Value};
@@ -22,6 +22,22 @@ pub struct FtsHit {
     pub score: f32,
     pub byte_start: u64,
     pub byte_end: u64,
+}
+
+/// Per-file attributes stamped onto every chunk document of a file (PRD §10.2).
+///
+/// `path_text`/`size`/`mtime_ns` mirror the manifest row; `title` comes from extracted
+/// document metadata (`doc_meta.title`) when available.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FtsFileMeta<'a> {
+    pub mime: &'a str,
+    pub lang: Option<&'a str>,
+    /// Display form of the file's path, indexed into `path_text`.
+    pub path_text: &'a str,
+    pub size: u64,
+    /// Unix mtime in nanoseconds; stored in the schema's `mtime` field.
+    pub mtime_ns: i64,
+    pub title: Option<&'a str>,
 }
 
 /// The set of schema fields (PRD §10.2), resolved once at open.
@@ -94,10 +110,12 @@ fn doc_u64(doc: &TantivyDocument, f: Field) -> u64 {
 /// The tantivy full-text index.
 ///
 /// Holds the single `IndexWriter` (`Send + !Sync`, one per index — owned by the writer
-/// thread) and a cheap-to-clone `IndexReader` for lock-free concurrent search (PRD §10.2).
+/// thread; absent for read-only opens) and a cheap-to-clone `IndexReader` for lock-free
+/// concurrent search (PRD §10.2).
 pub struct FtsIndex {
     index: Index,
-    writer: IndexWriter,
+    /// `None` for read-only opens ([`FtsIndex::open_readonly`]).
+    writer: Option<IndexWriter>,
     reader: IndexReader,
     fields: Fields,
 }
@@ -122,44 +140,74 @@ impl FtsIndex {
         let reader = index.reader().map_err(err)?;
         Ok(Self {
             index,
-            writer,
+            writer: Some(writer),
             reader,
             fields,
         })
     }
 
-    /// Add one chunk as a tantivy document.
-    pub fn add_chunk(
-        &mut self,
-        file_id: i64,
-        chunk: &Chunk,
-        mime: &str,
-        lang: Option<&str>,
-    ) -> Result<()> {
+    /// Open the index under `dir` for search only — no `IndexWriter` is created.
+    ///
+    /// Tantivy's writer lock is exclusive, so a writer-less handle is what allows multiple
+    /// processes to search the same index concurrently (searches run on snapshot readers).
+    /// Write operations (`add_chunk`, `delete_file`, `commit`) fail with `NdexError::Index`.
+    pub fn open_readonly(dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let (schema, fields) = build(false);
+        let fields = fields.expect("fields requested");
+        let mmap = MmapDirectory::open(dir).map_err(err)?;
+        let index = Index::open_or_create(mmap, schema).map_err(err)?;
+        let reader = index.reader().map_err(err)?;
+        Ok(Self {
+            index,
+            writer: None,
+            reader,
+            fields,
+        })
+    }
+
+    /// The writer, or an `NdexError::Index` for read-only handles.
+    fn writer_mut(&mut self) -> Result<&mut IndexWriter> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| NdexError::Index("FTS index is open read-only (no writer)".into()))
+    }
+
+    /// Add one chunk as a tantivy document, stamping the file-level `meta` fields onto it.
+    pub fn add_chunk(&mut self, file_id: i64, chunk: &Chunk, meta: &FtsFileMeta<'_>) -> Result<()> {
         let mut doc = TantivyDocument::default();
         doc.add_i64(self.fields.file_id, file_id);
         doc.add_u64(self.fields.chunk_ord, u64::from(chunk.chunk_ord));
         doc.add_text(self.fields.body, &chunk.text);
-        doc.add_text(self.fields.mime, mime);
-        if let Some(l) = lang {
+        if let Some(t) = meta.title {
+            doc.add_text(self.fields.title, t);
+        }
+        doc.add_text(self.fields.path_text, meta.path_text);
+        doc.add_text(self.fields.mime, meta.mime);
+        if let Some(l) = meta.lang {
             doc.add_text(self.fields.lang, l);
         }
         doc.add_u64(self.fields.byte_start, chunk.byte_start);
         doc.add_u64(self.fields.byte_end, chunk.byte_end);
-        self.writer.add_document(doc).map_err(err)?;
+        doc.add_u64(self.fields.size, meta.size);
+        doc.add_i64(self.fields.mtime, meta.mtime_ns);
+        self.writer_mut()?.add_document(doc).map_err(err)?;
         Ok(())
     }
 
-    /// Delete all documents for a file (PRD §13.8).
+    /// Delete all documents for a file (PRD §13.8) — a delete-by-term on `file_id`.
+    ///
+    /// Used by the reconciler to purge stale chunks before re-processing a file. Takes
+    /// effect at the next `commit`.
     pub fn delete_file(&mut self, file_id: i64) -> Result<()> {
-        self.writer
-            .delete_term(Term::from_field_i64(self.fields.file_id, file_id));
+        let term = Term::from_field_i64(self.fields.file_id, file_id);
+        self.writer_mut()?.delete_term(term);
         Ok(())
     }
 
     /// Commit pending documents to disk and refresh the reader (PRD §10.2 commit strategy).
     pub fn commit(&mut self) -> Result<()> {
-        self.writer.commit().map_err(err)?;
+        self.writer_mut()?.commit().map_err(err)?;
         self.reader.reload().map_err(err)?;
         Ok(())
     }
@@ -173,14 +221,31 @@ impl FtsIndex {
     }
 
     /// Run a BM25 query over `body`+`title`, applying the title field boost (PRD §10.7).
+    ///
+    /// Delegates to [`FtsIndex::search_with_total`], discarding the total.
     pub fn search(&self, query: &str, limit: usize, title_boost: f32) -> Result<Vec<FtsHit>> {
+        Ok(self.search_with_total(query, limit, title_boost)?.0)
+    }
+
+    /// Like [`FtsIndex::search`], but also returns the **true** total number of matching
+    /// documents (tantivy `Count` collector), independent of `limit`. Callers use it to
+    /// report accurate `total`/`truncated` values for paginated results.
+    pub fn search_with_total(
+        &self,
+        query: &str,
+        limit: usize,
+        title_boost: f32,
+    ) -> Result<(Vec<FtsHit>, u64)> {
         let searcher = self.reader.searcher();
         let mut parser =
             QueryParser::for_index(&self.index, vec![self.fields.body, self.fields.title]);
         parser.set_field_boost(self.fields.title, title_boost);
         let parsed = parser.parse_query(query).map_err(err)?;
-        let top = searcher
-            .search(&parsed, &TopDocs::with_limit(limit).order_by_score())
+        let (top, total) = searcher
+            .search(
+                &parsed,
+                &(TopDocs::with_limit(limit).order_by_score(), Count),
+            )
             .map_err(err)?;
         let mut hits = Vec::with_capacity(top.len());
         for (score, addr) in top {
@@ -193,7 +258,7 @@ impl FtsIndex {
                 byte_end: doc_u64(&doc, self.fields.byte_end),
             });
         }
-        Ok(hits)
+        Ok((hits, total as u64))
     }
 
     /// Generate a highlighted snippet for a specific `(file_id, chunk_ord)` hit (PRD §10.2).

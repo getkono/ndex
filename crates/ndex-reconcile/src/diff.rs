@@ -11,23 +11,26 @@ use crate::walk::WalkOutcome;
 pub struct DiffOutcome {
     /// Paths present on disk but not in the manifest.
     pub new: Vec<NdexPath>,
-    /// Paths whose `(size, mtime_ns)` changed.
+    /// Paths needing (re)processing: `(size, mtime_ns)` changed, or metadata-unchanged
+    /// rows still `Pending` / `FailedTransient` under the retry limit (PRD §11.5).
     pub modified: Vec<NdexPath>,
     /// `file_id`s present in the manifest but no longer on disk (→ `status=3`).
     pub deleted: Vec<i64>,
-    /// Count of unchanged files (their `last_verified_ns` is refreshed).
+    /// Count of unchanged files (count only; their manifest rows are not touched).
     pub unchanged: u64,
 }
 
-/// Classify walked entries against the manifest, tracking hard links by `(dev, inode)` so
-/// duplicate inodes share a canonical `file_id` (PRD §11.1). Parallelized with rayon.
-pub fn diff(manifest: &Manifest, walk: &WalkOutcome) -> Result<DiffOutcome> {
+/// Classify walked entries against the manifest with a sequential loop (one point query
+/// per file plus one `live_files` scan for deletions). Retry eligibility for
+/// metadata-unchanged rows is decided by [`Manifest::classify`] using `max_retries`
+/// (config `extraction.max_retries`). Read-only: a dry run may safely diff.
+pub fn diff(manifest: &Manifest, walk: &WalkOutcome, max_retries: u32) -> Result<DiffOutcome> {
     let mut out = DiffOutcome::default();
 
     for entry in &walk.files {
-        match manifest.classify(entry.key(), entry.value())? {
+        match manifest.classify(entry.key(), entry.value(), max_retries)? {
             Change::New => out.new.push(entry.key().clone()),
-            Change::Modified => out.modified.push(entry.key().clone()),
+            Change::Modified | Change::Retry => out.modified.push(entry.key().clone()),
             Change::Unchanged => out.unchanged += 1,
             Change::Deleted => {}
         }

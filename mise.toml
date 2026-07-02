@@ -4,11 +4,11 @@
 
 [tools]
 # Prebuilt binaries via the aqua-backed registry shortnames.
-taplo = "latest"        # TOML formatter/linter
-typos = "latest"        # spell checker
-actionlint = "latest"   # GitHub Actions linter
-pkl = "latest"          # Apple Pkl CLI (evaluates hk.pkl)
-hk = "latest"           # git hook manager
+taplo = "latest"      # TOML formatter/linter
+typos = "latest"      # spell checker
+actionlint = "latest" # GitHub Actions linter
+pkl = "latest"        # Apple Pkl CLI (evaluates hk.pkl)
+hk = "latest"         # git hook manager
 # cargo-backed tools (cargo-binstall fetches prebuilt binaries when available).
 "cargo:cargo-nextest" = "latest"
 "cargo:cargo-deny" = "latest"
@@ -49,11 +49,20 @@ run = ["typos", "actionlint", "cargo deny check"]
 description = "Build API docs"
 run = "cargo doc --workspace --no-deps"
 
+[tasks.boundary]
+description = "Enforce the thin-client boundary: ndex must not depend on engine crates"
+run = """
+if cargo tree -p ndex -e normal --prefix none | grep -E '^ndex-(store|extract|embed|search|reconcile|remote) '; then
+  echo 'thin-client boundary violated: ndex depends on an engine crate' >&2
+  exit 1
+fi
+"""
+
 [tasks.hooks-install]
 alias = "hooks"
 description = "Install hk git hooks for this repo"
 run = "hk install"
 
 [tasks.ci]
-description = "Full local CI: format-check, lint, clippy, test"
-depends = ["fmt-check", "lint", "clippy", "test"]
+description = "Full local CI: format-check, lint, clippy, boundary, test"
+depends = ["fmt-check", "lint", "clippy", "boundary", "test"]

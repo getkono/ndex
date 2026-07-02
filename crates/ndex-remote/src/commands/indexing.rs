@@ -30,7 +30,9 @@ fn build_identity(model: &str) -> Result<IndexIdentity> {
             .ok_or_else(|| NdexError::Config(format!("unknown embedding model: {model}")))?;
         EmbeddingIdentity {
             model_name: info.full_name.into(),
-            model_hash: info.onnx_blake3.into(),
+            // Empty = unpinned: the registry has no release hash yet (34-embedding.md);
+            // never bake a placeholder into the immutable identity.
+            model_hash: info.onnx_blake3.unwrap_or("").into(),
             dimensions: info.dimensions,
             mrl_dimensions: info.mrl_dimensions,
             vector_scalar: "f16".into(),
@@ -56,6 +58,16 @@ fn build_identity(model: &str) -> Result<IndexIdentity> {
 
 /// `ndex-remote init` — create a fresh index (PRD §13.4).
 pub fn init(args: InitArgs) -> Result<()> {
+    // Honesty over silence: these flags parse but no handler consumes them yet.
+    if !args.exclude.is_empty() {
+        eprintln!("warning: --exclude is not implemented in v0.1; ignoring");
+    }
+    if args.no_fts {
+        eprintln!("warning: --no-fts is not implemented in v0.1; ignoring");
+    }
+    if args.no_meta {
+        eprintln!("warning: --no-meta is not implemented in v0.1; ignoring");
+    }
     let identity = build_identity(&args.model)?;
     let _store = Store::create(&args.path, identity, Config::default())?;
     println!(
@@ -68,7 +80,14 @@ pub fn init(args: InitArgs) -> Result<()> {
 
 /// `ndex-remote index` — build or update the index (PRD §13.3).
 pub fn index(args: IndexArgs) -> Result<()> {
-    let mut store = Store::open(&args.path)?;
+    // Fail fast instead of queueing behind another writer's exclusive flock.
+    let Some(mut store) = Store::try_open(&args.path)? else {
+        return Err(NdexError::Lock(format!(
+            "another ndex process holds the index lock at {}/.ndex/lock; \
+             retry after it finishes",
+            args.path.display()
+        )));
+    };
 
     if args.status {
         let last = store.manifest.last_reconciliation_ns()?;
@@ -90,7 +109,11 @@ pub fn index(args: IndexArgs) -> Result<()> {
         max_file_size: args
             .max_file_size
             .as_deref()
-            .and_then(|s| s.parse::<ByteSize>().ok())
+            .map(|s| {
+                s.parse::<ByteSize>()
+                    .map_err(|e| NdexError::Config(format!("invalid --max-file-size: {e}")))
+            })
+            .transpose()?
             .map(ByteSize::bytes),
         only_new: args.only_new,
     };

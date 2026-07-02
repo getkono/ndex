@@ -104,6 +104,7 @@ pub struct ProcessedFile {
 
 /// Extracted document metadata (PRD §10.4 `doc_meta`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DocMeta {
     pub title: Option<String>,
     pub author: Option<String>,
@@ -121,6 +122,7 @@ pub struct DocMeta {
 ///
 /// `lens` is present here and in the wire `MediaMeta` (skeleton reconciliation of PRD §12.7).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MediaMeta {
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -143,6 +145,7 @@ pub struct MediaMeta {
 
 /// Summary metadata for an archive file (PRD §10.4 `archive_meta`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ArchiveMeta {
     pub member_count: Option<u32>,
     pub total_size: Option<u64>,

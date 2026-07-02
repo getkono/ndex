@@ -72,8 +72,9 @@ impl<R: Read> FrameReader<R> {
         Ok(buf)
     }
 
-    /// Scan forward for [`MAGIC_PREAMBLE`], discarding up to [`MAX_PREAMBLE_SCAN_BYTES`]
-    /// of leading garbage (shell-startup stdout). Errors if not found within the budget.
+    /// Scan forward for [`MAGIC_PREAMBLE`], discarding leading garbage (shell-startup
+    /// stdout). Exactly [`MAX_PREAMBLE_SCAN_BYTES`] garbage bytes are tolerated; one more
+    /// fails. Errors as soon as success within the budget becomes impossible.
     pub fn scan_preamble(&mut self) -> Result<()> {
         let magic = MAGIC_PREAMBLE;
         let mut matched = 0usize;
@@ -93,7 +94,10 @@ impl<R: Read> FrameReader<R> {
                 // MAGIC_PREAMBLE has no self-overlap, so a single-byte restart is correct.
                 matched = usize::from(byte[0] == magic[0]);
             }
-            if consumed > MAX_PREAMBLE_SCAN_BYTES + magic.len() {
+            // `consumed - matched` is the garbage count assuming the current partial
+            // match completes — the most optimistic case — so once it exceeds the
+            // budget, no suffix of the stream can succeed within it.
+            if consumed - matched > MAX_PREAMBLE_SCAN_BYTES {
                 return Err(NdexError::Protocol(
                     "protocol preamble not found; server stdout may be contaminated by shell \
                      startup output (see PRD §12.2)"

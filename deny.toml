@@ -2,6 +2,29 @@
 [advisories]
 version = 2
 yanked = "deny"
+# Each ignore is a deliberate, dated decision — revisit when the parent dep updates.
+ignore = [
+    # 2026-07-02: anyhow Error::downcast_mut unsoundness; we don't call downcast_mut.
+    # Waiting for a fixed anyhow release.
+    "RUSTSEC-2026-0190",
+    # 2026-07-02: memmap2 unchecked pointer offset; memmap2 is declared but not yet
+    # used by any code path (PRD §11 large-file mmap is unimplemented). Re-evaluate
+    # before wiring mmap reads.
+    "RUSTSEC-2026-0186",
+    # 2026-07-02: paste unmaintained (proc-macro, via tokenizers→macro_rules_attribute).
+    # Compile-time only; no runtime exposure. Waiting on tokenizers to migrate.
+    "RUSTSEC-2024-0436",
+    # 2026-07-02: quick-xml quadratic duplicate-attribute check (via
+    # pdf_oxide→office_oxide). PDF/DOCX extraction is a stub today; MUST be
+    # re-evaluated before those extractors go live — an indexer parses untrusted files.
+    "RUSTSEC-2026-0194",
+    # 2026-07-02: quick-xml NsReader memory-exhaustion DoS — same containment and
+    # same re-evaluation condition as RUSTSEC-2026-0194.
+    "RUSTSEC-2026-0195",
+    # 2026-07-02: ttf-parser unmaintained (via pdf_oxide). PDF extraction is a stub;
+    # revisit at pdf_oxide upgrade or when the PDF extractor lands.
+    "RUSTSEC-2026-0192",
+]
 
 [licenses]
 version = 2
@@ -17,11 +40,24 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "CC0-1.0",
+    "BSL-1.0",
+]
+# Per-crate exemptions: permissive licenses we accept only where they already occur.
+exceptions = [
+    # bzip2's C-translation backend; bzip2-1.0.6 is a BSD-style permissive license.
+    { allow = ["bzip2-1.0.6"], name = "libbz2-rs-sys" },
+    # NCSA is OSI-approved permissive (MIT/BSD hybrid); lockfile-only fuzzing shim.
+    { allow = ["NCSA"], name = "libfuzzer-sys" },
+    # Mozilla CA bundle data; CDLA-Permissive-2.0 covers data, not code we ship.
+    { allow = ["CDLA-Permissive-2.0"], name = "webpki-root-certs" },
 ]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal path dependencies carry no version by design; only registry wildcards
+# should be denied.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

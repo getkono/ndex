@@ -10,6 +10,6 @@ pub mod query;
 pub mod search;
 
 pub use fuse::{ScoreExplain, min_max_normalize, rrf_score};
-pub use mode::resolve;
+pub use mode::{Resolution, resolve};
 pub use query::embed_query;
 pub use search::{Hit, SearchOutcome, run};

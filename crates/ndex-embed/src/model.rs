@@ -12,10 +12,11 @@ pub struct ModelInfo {
     pub shortname: &'static str,
     /// Full model name (also the on-disk directory name).
     pub full_name: &'static str,
-    /// Expected BLAKE3 of `model.onnx` (hex). Filled in at release time.
-    pub onnx_blake3: &'static str,
-    /// Expected BLAKE3 of `tokenizer.json` (hex).
-    pub tokenizer_blake3: &'static str,
+    /// Expected BLAKE3 of `model.onnx` (hex). `None` = not yet pinned; set when a real
+    /// model artifact hash is known (release time — RELEASING.md).
+    pub onnx_blake3: Option<&'static str>,
+    /// Expected BLAKE3 of `tokenizer.json` (hex). `None` = not yet pinned.
+    pub tokenizer_blake3: Option<&'static str>,
     /// Native embedding dimensionality.
     pub dimensions: u32,
     /// MRL-truncated, stored/searched dimensionality.
@@ -30,9 +31,9 @@ pub struct ModelInfo {
 pub static REGISTRY: &[ModelInfo] = &[ModelInfo {
     shortname: "arctic",
     full_name: DEFAULT_MODEL,
-    // TODO(skeleton): pin real release artifact hashes/URL at packaging time (RELEASING.md).
-    onnx_blake3: "TODO",
-    tokenizer_blake3: "TODO",
+    // Not yet pinned: real release artifact hashes/URL land at packaging time (RELEASING.md).
+    onnx_blake3: None,
+    tokenizer_blake3: None,
     dimensions: 768,
     mrl_dimensions: 256,
     languages: 74,
