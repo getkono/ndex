@@ -5,6 +5,8 @@ use ndex_core::{SearchFilters, SearchMode};
 use ndex_embed::Embed;
 use ndex_store::Store;
 
+use crate::mode::Resolution;
+
 /// One engine-level hit. The server enriches this into a wire `SearchHit` by joining the
 /// manifest (path, mime, size, mtime) and generating a snippet.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,13 +25,21 @@ pub struct Hit {
     pub byte_end: u64,
 }
 
-/// The outcome of a search: ranked hits plus the resolved mode (PRD §12.7).
+/// The outcome of a search: ranked hits, the true match count, the mode that actually ran,
+/// and any user-facing warnings (PRD §12.7, §16.3).
 #[derive(Debug, Clone, Default)]
 pub struct SearchOutcome {
     pub hits: Vec<Hit>,
+    /// Corpus-wide match count (tantivy `Count` collector), independent of `limit`/`offset`.
     pub total: u64,
+    /// The mode retrieval actually executed. Explicit `Semantic` with an empty vector index
+    /// stays `Semantic` and returns zero hits — no silent FTS substitution (PRD §16.3).
     pub mode: SearchMode,
+    /// `true` when matches exist beyond this page: `offset + hits.len() < total`.
     pub truncated: bool,
+    /// User-facing warnings (e.g. the empty-vector fallback notices from
+    /// [`crate::mode::resolve`]); callers surface these to the user (stderr in the CLI).
+    pub warnings: Vec<String>,
 }
 
 /// Run a search: resolve the mode ([`crate::mode::resolve`]), execute FTS and/or semantic
@@ -44,16 +54,30 @@ pub fn run(
     limit: usize,
     offset: usize,
 ) -> Result<SearchOutcome> {
-    // v0.1 retrieves via FTS; semantic/hybrid degrade to FTS while the vector index is absent
+    // v0.1 retrieves via FTS; hybrid/auto degrade to FTS while the vector index is absent
     // (PRD §16.3). `embedder`/`filters` are reserved for the semantic + filtered-search follow-up.
     let _ = (embedder, filters);
     let vectors_empty = store.vectors.as_ref().is_none_or(|v| v.is_empty());
-    let mode = crate::mode::resolve(query, requested, vectors_empty);
+    let Resolution { mode, warnings } = crate::mode::resolve(query, requested, vectors_empty);
 
+    // Explicit semantic with no vectors runs nothing: zero hits, an honest `Semantic` mode,
+    // and a warning explaining why (PRD §16.3) — never a silent BM25 substitution.
+    if mode == SearchMode::Semantic && vectors_empty {
+        return Ok(SearchOutcome {
+            mode,
+            warnings,
+            ..SearchOutcome::default()
+        });
+    }
+
+    // Fetch a window just deep enough to serve the requested page (tantivy's `TopDocs`
+    // requires a limit ≥ 1, even when `limit == 0`). `total` is the true corpus-wide match
+    // count from the `Count` collector — independent of the window size.
     let fetch = limit.saturating_add(offset).max(1);
-    let fts_hits = store
-        .fts
-        .search(query, fetch, store.config.search.title_boost)?;
+    let (fts_hits, total) =
+        store
+            .fts
+            .search_with_total(query, fetch, store.config.search.title_boost)?;
 
     let raw: Vec<f32> = fts_hits.iter().map(|h| h.score).collect();
     let mut display = raw.clone();
@@ -75,22 +99,15 @@ pub fn run(
         })
         .collect();
 
-    let total = all.len() as u64;
     let hits: Vec<Hit> = all.into_iter().skip(offset).take(limit).collect();
-    let truncated = total > offset as u64 + hits.len() as u64;
+    // More matches exist past this page. With `limit == 0` the page is empty, `total` is
+    // still the real count, and (at `offset == 0`) `truncated ⇔ total > 0`.
+    let truncated = (offset as u64).saturating_add(hits.len() as u64) < total;
     Ok(SearchOutcome {
         hits,
         total,
         mode,
         truncated,
+        warnings,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    #[ignore = "skeleton: end-to-end search over a fixture index (fts/semantic/hybrid)"]
-    fn search_round_trip() {
-        todo!()
-    }
 }

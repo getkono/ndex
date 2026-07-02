@@ -114,7 +114,7 @@ Result of running one file through the extraction pipeline (PRD §4.3). Derives 
 
 ## Extracted metadata ✅
 
-All three mirror `meta.db` tables (PRD §10.4); the SQL is owned by [manifest/meta store](../20-store/22-manifest.md). All derive `Debug, Clone, Default, Serialize, Deserialize` with no serde attributes — every field is `Option`, so `..Default::default()` struct-update is the intended construction style (used throughout the characterization tests).
+All three mirror `meta.db` tables (PRD §10.4); the SQL is owned by [manifest/meta store](../20-store/22-manifest.md). All derive `Debug, Clone, Default, Serialize, Deserialize` and carry container-level `#[serde(default)]` — a payload missing any (or every) field decodes with the missing fields defaulted, satisfying the additive-evolution rule (PRD §12.3; wire consequences owned by [protocol messages](../50-protocol/53-messages.md)). Pinned by `meta_structs_msgpack_decode_from_empty_map` in `crates/ndex-core/tests/characterization.rs`. Every field is `Option`, so `..Default::default()` struct-update is the intended construction style (used throughout the characterization tests).
 
 ### `DocMeta` (`Eq`)
 
@@ -189,13 +189,13 @@ All four structs derive `Debug, Clone, PartialEq, Eq, Serialize, Deserialize`, n
 | TOML table | Struct | Fields |
 |---|---|---|
 | `[identity]` | `Identity` | `schema_version: u32`, `created_by: String`, `created_at: String` (ISO 8601 by convention, not parsed) |
-| `[embedding]` | `EmbeddingIdentity` | `model_name: String`, `model_hash: String` (BLAKE3 of the ONNX model file, hex), `dimensions: u32`, `mrl_dimensions: u32`, `vector_scalar: String` (e.g. `"f16"`), `hnsw_m: u32`, `hnsw_ef_construction: u32` |
+| `[embedding]` | `EmbeddingIdentity` | `model_name: String`, `model_hash: String` (BLAKE3 of the ONNX model file, hex; **empty = unpinned** — written when the registry has no release hash yet, or for `--model none`; see [embedding registry](../30-ingest/34-embedding.md)), `dimensions: u32`, `mrl_dimensions: u32`, `vector_scalar: String` (e.g. `"f16"`), `hnsw_m: u32`, `hnsw_ef_construction: u32` |
 | `[hashing]` | `Hashing` | `algorithm: String` |
 | `[fts]` | `FtsIdentity` | `tokenizer_version: u32` |
 
 `IndexIdentity` (the root) has methods:
 
-- `load(path: &Path) -> Result<Self>` — reads the file (I/O failure → `NdexError::Io`), then `toml::from_str` (parse failure → `NdexError::Config`). See [errors](14-errors.md) for the exit-code mapping.
+- `load(path: &Path) -> Result<Self>` — reads the file: a missing file (`ErrorKind::NotFound`) → `NdexError::IndexNotFound` carrying the path (exit 3); any other I/O failure → `NdexError::Io`; then `toml::from_str` (parse failure → `NdexError::Config`). Pinned by `identity_load_missing_file_is_index_not_found` and `identity_load_malformed_toml_is_config_error`. See [errors](14-errors.md) for the exit-code mapping.
 - `to_toml(&self) -> Result<String>` — TOML render; serialize failure → `NdexError::Config`. Round-trip pinned by `identity_toml_roundtrip`.
 - `check_compatible(&self) -> Result<()>` — errors with `NdexError::SchemaMismatch` iff `identity.schema_version != SCHEMA_VERSION`, message ``"index schema version {found} is not supported (this build expects {expected}); run `ndex reindex`"``. Pinned by `identity_schema_gate` (asserts the variant and its exit code). **Only** `schema_version` is checked — see Divergences.
 
@@ -215,7 +215,6 @@ Counts model tokens in a string. Defined in `ndex-core` (not `ndex-embed`) speci
 
 - **`MediaMeta.lens` vs PRD §12.7.** PRD §10.4's `media_meta` SQL table has a `lens` column, but PRD §12.7's wire `MediaMeta` struct omits it. The code includes `lens` in the single shared struct and its doc comment declares this a deliberate "skeleton reconciliation". The PRD is internally inconsistent; code standardizes on including `lens`.
 - **`check_compatible` is narrower than PRD §5.3.** The PRD also requires: "If embedding model differs, disable semantic search with a warning." No core API compares `model_name`/`model_hash`, and nothing checks `fts.tokenizer_version` or `hashing.algorithm`. Either a higher layer must implement the model check, or it is unimplemented.
-- **`IndexIdentity::load` on a missing file returns `NdexError::Io` (the general-error exit), not `IndexNotFound` (its dedicated exit code) — mapping owned by [errors](14-errors.md).** A malformed `index.toml` returns `Config`. If the CLI is supposed to report "index not found" when `.ndex/index.toml` is absent, a caller must translate — no core code does.
 - **`file_id` signedness.** Core uses `i64` (matching SQLite `INTEGER PRIMARY KEY`); PRD §12.7's wire `SearchHit`/`FileInfo` declare `file_id: u64`. Whichever the protocol crate uses, one side converts.
 - **Unenforced `Embedding` invariants.** Dimensionality (256), MRL truncation, and L2 normalization are doc-comment claims only; the type is an unvalidated `Vec<f16>` newtype.
 - **Stringly-typed `ArchiveMeta.extraction_status`** carries a three-value vocabulary as `Option<String>` with no enum, unlike `FileStatus` which got the full validated-integer treatment.

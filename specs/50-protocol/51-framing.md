@@ -42,7 +42,7 @@ offset   0               4
 ```
 
 - Length prefix is a **big-endian `u32`** counting payload bytes only. Pinned byte-exactly: a 5-byte payload produces header `00 00 00 05`; a 258-byte payload produces `00 00 01 02` (`length_prefix_is_u32_big_endian`).
-- Largest legal frame on the wire: 4 + 16 777 216 bytes. A payload of exactly `MAX_FRAME_BYTES` is accepted; one byte more is rejected on both sides.
+- Largest legal frame on the wire: 4 + 16 777 216 bytes. The cap is inclusive on both sides: a payload of exactly `MAX_FRAME_BYTES` is accepted (`frame_at_exactly_max_frame_bytes_roundtrips`); one byte more is rejected on write (`write_frame_rejects_oversize_payload`) and read (`read_frame_rejects_length_prefix_over_max_frame_bytes`).
 - **Empty payloads (`length = 0`) are legal at the framing layer** and round-trip (`frame_roundtrips_including_empty_payload`) — but an empty payload is not a decodable message; `from_slice(&[])` errors (`from_slice_on_garbage_bytes_is_err_not_panic`).
 - There is no checksum, sequence number, compression, or padding. Integrity is delegated to the transport (SSH / local pipe).
 
@@ -83,17 +83,17 @@ loop:
     read 1 byte; consumed += 1
     if byte == magic[matched]:
         matched += 1
-        if matched == 6: return Ok          # returns BEFORE the budget check
+        if matched == 6: return Ok
     else:
         matched = (byte == magic[0]) ? 1 : 0   # single-byte restart
-    if consumed > MAX_PREAMBLE_SCAN_BYTES + 6: return Err(Protocol)
+    if consumed - matched > MAX_PREAMBLE_SCAN_BYTES: return Err(Protocol)
 ```
 
 - The single-byte restart on mismatch is correct only because `MAGIC_PREAMBLE` has no self-overlapping prefix/suffix (asserted by a code comment, exploited by `scan_preamble_handles_partial_false_start`, which feeds `NDEXNDEX\x00` teaser prefixes).
-- Budget: the error fires once `consumed > 4102` without a completed match. Because the `Ok` return precedes the budget check within an iteration, a preamble whose final byte lands exactly on byte 4103 still succeeds — the effective garbage tolerance is **4097 bytes, one more than the documented 4096** (see Divergences).
+- Budget: `consumed - matched` is the garbage count under the most optimistic assumption that the current partial match completes, so the error fires at the earliest byte where success within the budget has become impossible. The garbage tolerance is **exactly `MAX_PREAMBLE_SCAN_BYTES` (4096) bytes, inclusive**: a preamble preceded by 4096 garbage bytes succeeds; 4097 fails. Boundary pinned at 4095/4096/4097 by `scan_preamble_garbage_budget_is_exactly_max_scan_bytes`.
 - Failure text (exact): `protocol preamble not found; server stdout may be contaminated by shell startup output (see PRD §12.2)`.
 - Any read failure mid-scan (including EOF) is wrapped as `NdexError::Protocol("reading preamble: {e}")` — unlike `read_frame`, where I/O errors pass through as `NdexError::Io`. Pinned by `scan_preamble_errs_on_empty_stream`.
-- Pinned behaviors: success at stream start, success after realistic MOTD garbage, failure after `MAX_PREAMBLE_SCAN_BYTES + 100` garbage bytes, failure on empty stream.
+- Pinned behaviors: success at stream start, success after realistic MOTD garbage, the exact 4095/4096/4097 budget boundary, failure after `MAX_PREAMBLE_SCAN_BYTES + 100` garbage bytes, failure on empty stream.
 
 ## 6. MessagePack codec ✅
 
@@ -104,7 +104,7 @@ loop:
 | `to_vec_named<T: Serialize>(&T) -> Result<Vec<u8>>` | `rmp_serde::to_vec_named` | `NdexError::Protocol("encode: {e}")` |
 | `from_slice<T: DeserializeOwned>(&[u8]) -> Result<T>` | `rmp_serde::from_slice` | `NdexError::Protocol("decode: {e}")` |
 
-- **`_named` mode is mandatory** (PRD §12.4): struct fields serialize as string-keyed map entries, which is what makes externally-tagged enum decoding and `#[serde(default)]` forward-compatibility work. The compact positional encoding (`rmp_serde::to_vec`) must never be used on the wire. How enums and each field type map to MessagePack is owned by [53-messages](53-messages.md).
+- **`_named` (struct-map) mode is mandatory** (PRD §12.4): struct fields serialize as string-keyed map entries, which is what makes externally-tagged enum decoding and `#[serde(default)]` forward-compatibility work. This is the codec decision that carries PRD §12.3's additive-evolution rule — with maps, a decoder skips unknown keys and fills absent defaulted fields; the compact positional encoding (`rmp_serde::to_vec`) breaks both properties and must never be used on the wire. Verified and pinned by the cross-version decode tests (`decode_ignores_unknown_extra_field`, `decode_fills_missing_defaulted_field`, `handshake_req_decodes_when_new_fields_are_absent`; contract details owned by [53-messages](53-messages.md) §1). How enums and each field type map to MessagePack is owned by [53-messages](53-messages.md).
 - Decode is total: truncated input (`from_slice_on_truncated_bytes_is_err_not_panic`) and garbage input including the empty slice (`from_slice_on_garbage_bytes_is_err_not_panic`) return `Err`, never panic.
 - The codec is deterministic for a given value but **not canonical** — nothing depends on byte-identical re-encoding.
 
@@ -116,6 +116,7 @@ loop:
 
 1. **Oversize error text differs from PRD §12.2.** PRD prescribes `"Frame size <N> exceeds 16 MiB limit."`; code emits `frame size {N} exceeds 16777216 byte limit`. Cosmetic, but the PRD text is presented as a contract.
 2. **Overflow response behavior is unimplemented.** PRD §12.2 requires the receiver to close the connection and, if possible, send an `Error` message; `read_frame` only returns `Err`. Enforcement is deferred to the ⛔ serve loop / session. Likewise PRD's guarantee that the server truncates a pathological `SearchHit` snippet before framing has no code anywhere.
-3. **Garbage tolerance off-by-one vs. its own doc comment.** `scan_preamble` documents "up to `MAX_PREAMBLE_SCAN_BYTES` of leading garbage" but the budget check (`consumed > 4096 + 6`) accepts a preamble preceded by 4097 garbage bytes. No test exercises the boundary (largest tested garbage is 43 bytes for success, 4196 for failure).
-4. **Preamble epoch byte vs. protocol version.** `constants.rs` calls the trailing `0x01` a "protocol-epoch byte"; PRD §12.2 calls it a "version byte". Neither defines whether it tracks the negotiated protocol version ([52-handshake](52-handshake.md)) — i.e., whether a future protocol 2 changes the preamble. Undefined.
-5. **Error-type asymmetry between the two read paths.** EOF during `read_frame` is `NdexError::Io`; EOF during `scan_preamble` is `NdexError::Protocol`. Both map to the same generic exit code today ([14-errors](../10-core/14-errors.md)), but the inconsistency will matter if exit-code mapping ever distinguishes them.
+3. **Preamble epoch byte vs. protocol version.** `constants.rs` calls the trailing `0x01` a "protocol-epoch byte"; PRD §12.2 calls it a "version byte". Neither defines whether it tracks the negotiated protocol version ([52-handshake](52-handshake.md)) — i.e., whether a future protocol 2 changes the preamble. Undefined.
+4. **Error-type asymmetry between the two read paths.** EOF during `read_frame` is `NdexError::Io`; EOF during `scan_preamble` is `NdexError::Protocol`. Both map to the same generic exit code today ([14-errors](../10-core/14-errors.md)), but the inconsistency will matter if exit-code mapping ever distinguishes them.
+
+*Resolved 2026-07: the former garbage-tolerance off-by-one (a preamble after 4097 garbage bytes was accepted while the doc comment promised 4096) — the budget check is now `consumed - matched > MAX_PREAMBLE_SCAN_BYTES`, making the tolerance exactly 4096 inclusive, boundary-pinned (§5).*

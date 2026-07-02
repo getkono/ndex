@@ -15,13 +15,14 @@ benchmarks.
 - `crates/ndex-reconcile/src/refresh.rs`
 - `crates/ndex-reconcile/benches/reconcile.rs`
 - `crates/ndex-reconcile/Cargo.toml`
-- Tests: `crates/ndex-reconcile/tests/characterization.rs` (10 tests, all live — see
+- Tests: `crates/ndex-reconcile/tests/characterization.rs` (19 tests, all live — see
   [80-testing](../80-testing.md))
 
 Types this crate consumes but does not own: `WalkEntry`, `DirWalkEntry`, `FileRecord`,
 `FileStatus`, `SCHEMA_VERSION` ([11-data-model](../10-core/11-data-model.md)); `NdexPath`
 ([12-paths](../10-core/12-paths.md)); `Config` sections `walk`, `ignore`, `auto_refresh`,
-`chunking` and the constants `NDEX_DIR`, `NDEX_OLD_DIR`, `NDEXIGNORE_FILE`
+`chunking`, `extraction` (`max_file_size`, `max_retries`) and the constants `NDEX_DIR`,
+`NDEX_OLD_DIR`, `NDEXIGNORE_FILE`
 ([13-config](../10-core/13-config.md)); `NdexError`/`Result`
 ([14-errors](../10-core/14-errors.md)); `ProgressSink`, `ProgressUpdate`, `ProgressKind`,
 `NullSink` ([15-search-and-progress-types](../10-core/15-search-and-progress-types.md));
@@ -46,19 +47,28 @@ worker pool, no channel, and no background thread anywhere in this crate in v0.1
 ```
 Reconciler::run(options, sink)
 │
-├─ begin_run(kind, "mtime")            kind = Full if options.full else Incremental
+├─ warn_ignored_options(options)       tracing::warn naming verify/jobs/batch_size/
+│                                       no_vectors when set (accepted-but-ignored)
+├─ (skipped when dry_run — dry runs write NOTHING)
+│     recover(store)                   purge uncommitted index state (§6)
+│     promote_exhausted_transients     status=2, fail_count ≥ max_retries → status=4
+│     begin_run(kind, "mtime")         kind = Full if options.full else Incremental
 │                                       (manifest bookkeeping → 22-manifest)
 ├─ PHASE 1  walk(root, config)         emit ProgressKind::Walk "scanning files"
 │     └─ preflight_memory(#files)      abort if est. memory > 75% of total RAM
 │
-├─ PHASE 2  diff(manifest, walk)       emit ProgressKind::Diff "computing changes"
+├─ PHASE 2  diff(manifest, walk, max_retries)   emit ProgressKind::Diff (read-only)
 │
 ├─ PHASE 3  (skipped when dry_run)
-│     process(store, embedder, diff, sink)
-│       ├─ per new/modified file:      emit ProgressKind::Extract tick
-│       │    stat → upsert → read → mime → extract → chunk → FTS → meta → status
-│       ├─ per deleted file_id:       FTS delete, meta delete, status=Deleted
-│       └─ fts.commit()               emit ProgressKind::Fts (total, total)
+│     process(store, embedder, diff, options, sink)
+│       ├─ per new/modified/retry file:  emit ProgressKind::Extract tick
+│       │    stat → upsert → size gate → read → BLAKE3 → mime → route/skip →
+│       │    extract → FTS delete-before-add → chunk → FTS stage → meta
+│       │    (modified/retry files skipped entirely when options.only_new)
+│       ├─ every BATCH_COMMIT_FILES successes: fts.commit() THEN mark_indexed batch
+│       ├─ per deleted file_id:        FTS delete + meta delete staged
+│       └─ end of run:                 emit ProgressKind::Fts (total, total),
+│                                       fts.commit() THEN mark_indexed + mark_deleted
 │     finish_run(run_id)
 │     touch_last_reconciliation(now)
 │     prune_reconciliation_runs(1000)
@@ -66,9 +76,14 @@ Reconciler::run(options, sink)
 └─ stats.duration_ms = elapsed        returned as ReconcileStats
 ```
 
+**Crash-safety invariant (owned here, enforced by ordering):** `status = Indexed` implies
+the file's chunks are durably committed in the FTS index. Every FTS `commit()` happens
+**before** the corresponding manifest status flip; a crash on either side leaves files
+`Pending`, which the next run reprocesses idempotently (delete-before-add). See §4 and §6.
+
 End-to-end behavior is locked by the characterization test `full_reconcile_indexes_a_tree`:
 indexing a fresh two-file tree yields `new=2, processed=2, failed=0`, and an immediate
-second run yields `new=0, unchanged=2` (idempotence).
+second run yields `new=0, unchanged=2, processed=0` (idempotence).
 
 ---
 
@@ -95,10 +110,20 @@ precedence over `.gitignore` in the `ignore` crate's matcher order, matching PRD
 excludes `skip.log` while `keep.txt` is walked). Note that `.ignore` files are *also*
 honored (side effect of `.ignore(true)`); the PRD hierarchy does not mention them.
 
-**Self-exclusion:** a `filter_entry` closure skips any entry whose **file name** equals
-`NDEX_DIR` or `NDEX_OLD_DIR` (values owned by [13-config](../10-core/13-config.md)), so the
-index directory and the reindex staging copy are never descended into. Because the filter
-is name-based, a user directory named `.ndex` at *any* depth is also skipped.
+**Self-exclusion and containment:** a single `filter_entry` closure (the `ignore` crate
+holds one predicate, so both rules share it) rejects:
+- any entry whose **file name** equals `NDEX_DIR` or `NDEX_OLD_DIR` (values owned by
+  [13-config](../10-core/13-config.md)), so the index directory and the reindex staging
+  copy are never descended into. Because the filter is name-based, a user directory named
+  `.ndex` at *any* depth is also skipped;
+- any symlinked entry (`entry.path_is_symlink()`) whose `std::fs::canonicalize`d target
+  does not start with the canonicalized root (computed once per walk;
+  canonicalize-failure on the root falls back to the raw root path). Escaping symlinks —
+  and, because a rejected directory entry is not descended into, their whole subtrees —
+  are skipped with a `tracing::debug`; an unresolvable (broken) symlink is likewise
+  skipped. Symlinks resolving *within* the root pass through and follow the normal
+  `follow_links` behavior. Locked by
+  `walk_skips_symlinks_escaping_the_root_but_follows_within_root`.
 
 **Entry handling:**
 - Walker errors (unreadable paths, symlink loops reported by the `ignore` crate) →
@@ -119,13 +144,15 @@ Paths are captured as raw bytes via `NdexPath::from_os_str` on the walker-yielde
 `mode`, `size` come straight from Unix `MetadataExt`. Field shapes are owned by
 [11-data-model](../10-core/11-data-model.md).
 
-### 2.2 Symlink policy — 🚧 partial
+### 2.2 Symlink policy — ✅ implemented
 
 `follow_links` comes from config (default follows, PRD §11.4's `find -L` behavior). Cycle
 handling is delegated to the `ignore` crate, whose loop errors surface through the
-warn-and-skip path above. **Not implemented:** the PRD §11.4 rule that symlinks pointing
-*outside the index root* are not followed — there is no containment check, so
-`/pool/archive/link → /etc` would be followed and indexed (see Divergences).
+warn-and-skip path above. The PRD §11.4 containment rule — symlinks pointing *outside the
+index root* are not followed — is enforced by the `filter_entry` canonicalization check
+(§2.1), so `/pool/archive/link → /etc` is skipped, not indexed. The containment check
+runs regardless of `follow_symlinks` (harmless when following is off: unfollowed symlinks
+were never collected anyway).
 
 ### 2.3 `WalkOutcome` — ✅ implemented
 
@@ -158,18 +185,24 @@ emptiness is pinned by `walk_and_diff_outcomes_default_empty`.
 
 ## 3. Phase 2 — manifest diff (`diff.rs`)
 
-### 3.1 `diff(manifest, walk) -> DiffOutcome` — 🚧 partial
+### 3.1 `diff(manifest, walk, max_retries) -> DiffOutcome` — 🚧 partial
 
-A **sequential** loop over `walk.files` (the doc comment claims rayon parallelization —
-false; see Divergences). Each entry is classified by
-[`Manifest::classify`](../20-store/22-manifest.md) (which owns the `(size, mtime_ns)`
-comparison rule and the `Change` enum):
+A **sequential** loop over `walk.files` (its doc comment now says so). Each entry is
+classified by [`Manifest::classify`](../20-store/22-manifest.md) (which owns the
+`(size, mtime_ns)` comparison rule, the retry-eligibility rule, and the `Change` enum);
+`max_retries` is threaded through from config `extraction.max_retries` by
+`Reconciler::run`:
 
 - `Change::New` → push path onto `out.new`
-- `Change::Modified` → push path onto `out.modified`
-- `Change::Unchanged` → `out.unchanged += 1` (count only — **no** manifest write; the
-  field's doc-comment claim that `last_verified_ns` is refreshed is not implemented)
+- `Change::Modified` **or** `Change::Retry` → push path onto `out.modified` (retries —
+  metadata-unchanged `Pending` or under-limit `FailedTransient` rows — share the modified
+  bucket and are therefore also counted in `stats.modified`)
+- `Change::Unchanged` → `out.unchanged += 1` (count only — no manifest write; includes
+  `Indexed`, `Skipped`, `FailedPermanent`, and exhausted transients)
 - `Change::Deleted` → ignored (never produced by `classify`)
+
+`diff` is **read-only** — the transient→permanent promotion write happens in
+`Reconciler::run` before Phase 1 (§5.1), never here, so a dry run may diff safely.
 
 Deletions are detected by a second pass: every `(file_id, path)` from
 [`Manifest::live_files`](../20-store/22-manifest.md) (non-deleted rows) whose path is
@@ -194,7 +227,7 @@ specifies canonical-`file_id` dedup with extraction skipped for duplicate inodes
 ```rust
 pub struct DiffOutcome {
     pub new: Vec<NdexPath>,       // on disk, not in manifest
-    pub modified: Vec<NdexPath>,  // (size, mtime_ns) changed
+    pub modified: Vec<NdexPath>,  // (size, mtime_ns) changed, or Pending/FailedTransient retry
     pub deleted: Vec<i64>,        // manifest file_ids no longer on disk
     pub unchanged: u64,           // count only
 }
@@ -204,66 +237,103 @@ pub struct DiffOutcome {
 
 ## 4. Phase 3 — process (`process.rs`)
 
-### 4.1 `process(store, embedder, diff, sink) -> ReconcileStats` — 🚧 partial
+### 4.1 `process(store, embedder, diff, options, sink) -> ReconcileStats` — 🚧 partial
 
 Synchronous, single-threaded, **FTS-only**. The `embedder` parameter is accepted and
 explicitly discarded (`let _ = embedder;`) — semantic embedding is deferred to the
 vector-index follow-up, so `ProgressKind::Embed` is never emitted and no vectors are
-written. There is no BLAKE3 hashing, no bounded channel, no rayon pool, and no dedicated
-writer threads — the PRD §11.1 "multi-threaded pipeline with backpressure" does not exist
-yet (the crate's `Cargo.toml` already declares `rayon`, `crossbeam-channel`, `memmap2`,
-and `blake3` for it, all currently unused).
+written. There is no bounded channel, no rayon pool, and no dedicated writer threads —
+the PRD §11.1 "multi-threaded pipeline with backpressure" does not exist yet (the crate's
+`Cargo.toml` declares `rayon`, `crossbeam-channel`, and `memmap2` for it, still unused;
+`blake3` is now used).
+
+Inputs resolved here:
+- **Effective `max_file_size`** = `options.max_file_size` if set, else config
+  `extraction.max_file_size` (default owned by [13-config](../10-core/13-config.md)).
+- **`options.only_new`**: when set, the modified list is not iterated **and deletions are
+  not applied** — only `diff.new` files are processed (the `quick_reconcile` contract,
+  §8.2). `stats.modified` still reports the diff count for visibility.
 
 Iteration order: all of `diff.new`, then all of `diff.modified` (order within each vector
 is `DashMap` iteration order — unspecified). Before each file, a `ProgressKind::Extract`
-tick is emitted with `current` = 1-based file counter and
-`total = new.len() + modified.len()`.
+tick is emitted with `current` = 1-based file counter and `total` = the number of files
+actually processed this run (`new + modified`, or just `new` under `only_new`).
 
-### 4.2 Per-file algorithm (`process_one`) — 🚧 partial
+**Batched commit ordering (the crash-safety invariant, §1):** successful files accumulate
+as `(file_id, blake3)` pairs. Every **`BATCH_COMMIT_FILES = 100`** (public crate constant)
+successes — and once at end of run — `flush_indexed` runs `fts.commit()` **first**, then
+[`Manifest::mark_indexed`](../20-store/22-manifest.md) flips that batch to `Indexed`
+(persisting `blake3` and the `index_progress` rows) in a single SQLite transaction.
+A crash between commit and flip leaves the batch `Pending` → reprocessed next run →
+delete-before-add prevents duplicate chunks. A crash before the commit loses only the
+staged (uncommitted) tantivy documents.
+
+### 4.2 Per-file algorithm (`process_one`) — ✅ implemented (FTS scope)
 
 1. **Restat** via `std::fs::symlink_metadata`. On error (file vanished/unreadable between
    walk and now): `tracing::debug!`, return `Failed` — **no manifest write** (a brand-new
    file leaves no row; a modified file's old row is left untouched and will surface as
    deleted or modified on the next run).
 2. **Intent write:** [`Manifest::upsert_walked`](../20-store/22-manifest.md) with the
-   *fresh* stat values (that doc owns the status-reset-to-`Pending` semantics). This is
+   *fresh* stat values (that doc owns the changed-only status-reset semantics). This is
    the "status = 0 intent" half of PRD §11.2's two-phase commit.
-3. **Read** the whole file with `std::fs::read` (unbounded — `max_file_size` is not
-   enforced; no `Skipped` status is ever produced). On error:
+3. **Size gate:** if the restat size exceeds the effective `max_file_size`, the file is
+   **skipped without ever being read** (PRD §11.5: too large → `Skipped`): see the skip
+   path below. Locked by `oversized_files_are_skipped_without_reading`.
+4. **Read** the whole file with `std::fs::read`. On error: `tracing::warn!`, then
    `set_status(file_id, classify_io_error(&e), Some(msg))`, return `Failed`.
-4. **MIME detection** via `ndex_extract::mime::detect` ([32-extraction](32-extraction.md)).
-5. **Extract** through `router(&mime)` inside `with_panic_isolation` (both owned by
-   [32-extraction](32-extraction.md)), with `ExtractCtx { mime, path, tokens, depth: 0,
-   config }`. Any extraction error *or caught panic* →
-   `set_status(file_id, FailedPermanent, Some(msg))` and `Failed` — there is no
-   transient-then-promote retry ladder (PRD §11.5 wants transient for the first
-   `max_retries` attempts; see Divergences). Errors are logged at `debug`, not the PRD's
-   `WARN`.
-6. **Re-index:** `fts.delete_file(file_id)` then `Chunker::new(&WordTokens,
-   &config.chunking).chunk(file_id, &blocks)` ([33-chunking](33-chunking.md)) and one
-   `fts.add_chunk(file_id, chunk, &mime, lang)` per chunk
-   ([23-fts](../20-store/23-fts.md)).
-7. **Metadata:** `meta.upsert_doc_meta` / `meta.upsert_media_meta` when the extraction
-   produced them ([22-manifest](../20-store/22-manifest.md)).
-8. **Commit markers:** `set_status(file_id, Indexed, None)` **then**
-   `record_progress(file_id, "fts", SCHEMA_VERSION)`. Note the ordering: status is
-   flipped to `Indexed` *before* the `index_progress` row is written, and both happen
-   *before* the run-level `fts.commit()` — the inverse of PRD §11.2 (see Divergences).
+5. **BLAKE3:** `blake3::hash(&bytes)` over the whole-file read; carried in the
+   `Indexed` disposition and persisted by the post-commit `mark_indexed` batch (single
+   write path). Hash correctness is pinned against the official vectors (empty input,
+   `"abc"`) by `blake3_matches_official_known_vectors`; persistence by
+   `blake3_hash_is_persisted_for_indexed_files`.
+6. **MIME detection** via `ndex_extract::mime::detect` ([32-extraction](32-extraction.md)).
+7. **Route:** `router(&mime)` ([32-extraction](32-extraction.md)) returns
+   `Route::Extract(extractor)` or `Route::Skip` (unmatched MIME, incl.
+   `application/octet-stream`). `Route::Skip` → the skip path below. Locked by
+   `unsupported_mime_is_skipped_with_status_5`.
+8. **Extract** inside `with_panic_isolation` with `ExtractCtx { mime, path, tokens,
+   depth: 0, config }`. Any extraction error *or caught panic* → `tracing::warn!` and
+   `set_status(file_id, FailedTransient, Some(msg))`, return `Failed` — per PRD §11.5,
+   extraction errors are transient for the first `max_retries` attempts; the promotion
+   to `FailedPermanent` happens at the start of a later run (§5.1).
+9. **Re-index (delete-before-add):** `fts.delete_file(file_id)` then
+   `Chunker::new(&WordTokens, &config.chunking).chunk(file_id, &blocks)`
+   ([33-chunking](33-chunking.md)) and one `fts.add_chunk(file_id, chunk, &meta)` per
+   chunk, where `meta` is an [`FtsFileMeta`](../20-store/23-fts.md) built from the
+   detected mime, extraction `lang`, `path.display_lossy()`, restat `size`/`mtime_ns`,
+   and `doc_meta.title` when present.
+10. **Metadata:** `meta.upsert_doc_meta` / `meta.upsert_media_meta` when the extraction
+    produced them ([22-manifest](../20-store/22-manifest.md)).
+11. **Return `Indexed { file_id, blake3 }`** — no status write here; the flip to
+    `Indexed` is deferred to the post-commit batch (§4.1). Pinned by the unit test
+    `status_stays_pending_until_post_commit_flip` (drives `process_one` without a commit
+    and asserts the status is still `Pending` with no progress row and no `blake3`).
+
+**Skip path** (steps 3 and 7): `fts.delete_file(file_id)` (purges stale chunks if a
+previously indexed file transitioned to skippable), `set_status(file_id, Skipped,
+Some(reason))` (the reason — oversize or "no extractor for mime …" — lands in
+`error_msg`), `Manifest::clear_progress(file_id)`, return `Skipped` → `stats.skipped += 1`.
+No content is written to the FTS and no progress row remains. A `Skipped` file with
+unchanged metadata is `Unchanged` on later runs — even if the effective `max_file_size`
+changes, it is only reconsidered when the file itself changes.
 
 `WordTokens` (defined here) is the v0.1 token counter used for chunk sizing: token count =
 `str::split_whitespace().count()`. No model tokenizer is loaded.
 
 ### 4.3 Deletions and commit — ✅ implemented (within v0.1 scope)
 
-After the new/modified loop, for each `file_id` in `diff.deleted`:
-`fts.delete_file(file_id)`, `meta.delete_file(file_id)`,
-`set_status(file_id, FileStatus::Deleted, None)`, `stats.deleted += 1`. No progress ticks
-are emitted for deletions.
+After the processing loop (and only when not `only_new`), for each `file_id` in
+`diff.deleted`: `fts.delete_file(file_id)`, `meta.delete_file(file_id)`,
+`stats.deleted += 1` — the status flip is **staged, not applied**. No progress ticks are
+emitted for deletions.
 
-Finally a single `ProgressKind::Fts` tick `(total, total)` is emitted and
-**`store.fts.commit()` is called exactly once per run** — Tantivy durability semantics are
-owned by [23-fts](../20-store/23-fts.md); the once-per-run placement (and its crash
-window, §6) is this crate's fact.
+Finally a single `ProgressKind::Fts` tick `(total, total)` is emitted, the run-final
+`flush_indexed` runs (`fts.commit()` then `mark_indexed` for the tail batch), and
+[`Manifest::mark_deleted`](../20-store/22-manifest.md) flips the deleted rows to
+`Deleted` and drops their progress rows — the same commit-before-flip ordering as
+indexing. Tantivy durability semantics are owned by [23-fts](../20-store/23-fts.md); the
+batch placement is this crate's fact.
 
 ### 4.4 Failure classification helpers
 
@@ -280,19 +350,25 @@ window, §6) is this crate's fact.
   no post-extraction restat, so a file modified mid-extraction is indexed with stale
   content and marked `Indexed`, not re-queued as `FailedTransient`.
 
-### 4.5 Error-handling policy — ✅ implemented (as designed for v0.1)
+### 4.5 Error-handling policy — ✅ implemented (PRD §11.5 within FTS scope)
 
 Two tiers:
 - **Per-file soft failure:** any stat/read/extract failure for one file yields
-  `Disposition::Failed`, increments `stats.failed`, and the run continues.
+  `Disposition::Failed`, increments `stats.failed`, and the run continues. Read and
+  extraction failures log at `WARN` (PRD §11.5 logging tier); stat-time failures at
+  `debug`.
 - **Store-level hard failure:** any error from manifest/FTS/meta operations propagates via
   `?` and **aborts the whole run** (approximates PRD §11.5 "critical errors stop
   processing"; there is no WAL-flush-then-abort special-casing).
 
-Retry accounting: `set_status` bumps `fail_count` for failure statuses (rule owned by
-[22-manifest](../20-store/22-manifest.md)), but nothing in this crate reads `fail_count`,
-promotes transient→permanent at `max_retries`, or re-queues `FailedTransient` files whose
-metadata is unchanged — see Divergences.
+Retry accounting (PRD §11.5): `set_status` bumps `fail_count` on each failure (rule owned
+by [22-manifest](../20-store/22-manifest.md)); metadata-unchanged `Pending`/under-limit
+`FailedTransient` rows are re-queued by the diff (§3.1); rows with `fail_count ≥
+max_retries` are promoted to `FailedPermanent` by the pre-walk sweep (§5.1) instead of
+being retried; a success clears the streak (`mark_indexed` resets `fail_count`/
+`error_msg`); a metadata change resets it (`upsert_walked` changed-only reset). Locked by
+`transient_failure_is_retried_when_under_the_limit` and
+`exhausted_transient_failure_is_promoted_not_retried`.
 
 ---
 
@@ -307,15 +383,23 @@ ignores it regardless).
 `run(&ReconcileOptions, &dyn ProgressSink) -> Result<ReconcileStats>` executes the flow in
 §1. Facts owned here:
 
+- **Ignored-option honesty:** before anything else, one `tracing::warn!` names every set
+  option among `verify`/`jobs`/`batch_size`/`no_vectors` (accepted-but-ignored, §5.2),
+  once per run.
+- **Non-dry preamble (in order):** `recover(store)` (§6), then
+  `promote_exhausted_transients(extraction.max_retries)` (a `tracing::info!` reports a
+  non-zero promotion count), then `begin_run`. Promotion runs **before** the diff so an
+  exhausted file is neither retried this run nor misclassified later.
 - Run kind: `options.full` selects `RunKind::Full`, otherwise `RunKind::Incremental`;
   the change-detection method string recorded with the run is `"mtime"`. (`full` changes
   *only* this label — there is no forced re-extraction path.)
 - Phase markers: `ProgressKind::Walk` with message `"scanning files"`, `ProgressKind::Diff`
   with `"computing changes"`, each with `current=0, total=None`.
-- **Dry run:** Phase 3 is skipped; stats are populated from the diff
-  (`deleted = diff.deleted.len()`); `finish_run`, `touch_last_reconciliation`, and pruning
-  are all skipped. The `begin_run` row **is still written** and left unfinished — a dry
-  run mutates the manifest.
+- **Dry run:** pure — recovery, promotion, `begin_run`, Phase 3, `finish_run`,
+  `touch_last_reconciliation`, and pruning are all skipped; stats are populated from the
+  diff (`deleted = diff.deleted.len()`). A dry run performs **no write of any kind**
+  (walk and diff are read-only). Locked by `dry_run_reports_but_writes_nothing` (empty
+  `files` and `reconciliation_runs` tables, no `last_reconciliation_ns`).
 - On a real run, after `process`: `finish_run(run_id)`,
   `touch_last_reconciliation(now_ns)`, `prune_reconciliation_runs(RUN_HISTORY)` with
   **`RUN_HISTORY = 1000`** (matches PRD §10.1 retention).
@@ -327,69 +411,85 @@ ignores it regardless).
 ```rust
 pub struct ReconcileOptions {
     pub full: bool,            // ✅ honored (RunKind label only)
-    pub verify: bool,          // ⛔ accepted, never read
-    pub dry_run: bool,         // ✅ honored
-    pub jobs: Option<usize>,   // ⛔ accepted, never read
-    pub batch_size: Option<usize>,   // ⛔ accepted, never read
-    pub no_vectors: bool,      // ⛔ accepted, never read (vectors off unconditionally)
-    pub max_file_size: Option<u64>,  // ⛔ accepted, never read
-    pub only_new: bool,        // ⛔ accepted, never read (see §8.2)
+    pub verify: bool,          // ⛔ accepted, ignored (warned, §5.1)
+    pub dry_run: bool,         // ✅ honored (pure runs, §5.1)
+    pub jobs: Option<usize>,   // ⛔ accepted, ignored (warned)
+    pub batch_size: Option<usize>,   // ⛔ accepted, ignored (warned)
+    pub no_vectors: bool,      // ⛔ accepted, ignored (warned; vectors off unconditionally)
+    pub max_file_size: Option<u64>,  // ✅ honored (overrides config extraction.max_file_size)
+    pub only_new: bool,        // ✅ honored (new files only, §4.1, §8.2)
 }
 ```
 
-Only `full` and `dry_run` affect behavior. `Default` is all-false/`None`, pinned by
-`reconcile_options_default_is_inert`. There is no `exclude` field — PRD §11.1's
-`--exclude` layer of the ignore hierarchy cannot reach the walk (the remote CLI's flag is
-dropped at the mapping boundary; see [63-remote](../60-interfaces/63-remote.md)).
+`Default` is all-false/`None`, pinned by `reconcile_options_default_is_inert`. There is
+no `exclude` field — PRD §11.1's `--exclude` layer of the ignore hierarchy cannot reach
+the walk (the remote CLI's flag is dropped at the mapping boundary; see
+[63-remote](../60-interfaces/63-remote.md)).
 
-### 5.3 `ReconcileStats` — ✅ implemented (fields), 🚧 semantics
+### 5.3 `ReconcileStats` — ✅ implemented
 
 ```rust
 pub struct ReconcileStats {
     pub new: u64,        // diff count (attempted, not succeeded)
-    pub modified: u64,   // diff count
-    pub deleted: u64,    // deletions applied (== diff count)
+    pub modified: u64,   // diff count: metadata changes + retries (reported even under only_new)
+    pub deleted: u64,    // deletions applied (0 under only_new)
     pub unchanged: u64,
     pub processed: u64,  // files reaching Indexed
     pub failed: u64,     // per-file soft failures
-    pub skipped: u64,    // never incremented in v0.1
+    pub skipped: u64,    // Skipped dispositions (unsupported mime / oversize)
     pub duration_ms: u64,
     pub timed_out: bool, // never set true in v0.1 (no time-boxing exists)
 }
 ```
 
 Zeroed default pinned by `reconcile_stats_default_is_zeroed`. `new + modified =
-processed + failed` on a completed run.
+processed + failed + skipped` on a completed full run (not under `only_new`, where
+modified files are reported but not attempted).
 
 ---
 
 ## 6. Crash safety and recovery (`recover.rs`)
 
-### 6.1 `recover(store) -> Result<()>` — 🚧 partial (deliberate no-op)
+### 6.1 `recover(store) -> Result<()>` — ✅ implemented (FTS scope)
 
-The body ignores its argument and returns `Ok(())`. The in-code rationale: v0.1's
-synchronous pipeline writes manifest/FTS/meta within a single run; SQLite (WAL) and
-Tantivy each recover their own partial state on open, so there is nothing to replay. The
-PRD §11.2 recovery work — resweep of `status=Pending` (intent-written) files, re-run of
-indices missing an `index_progress` row, and USearch/sidecar count repair (§10.3) — is
-deferred to the vector-index follow-up.
+Called by `Reconciler::run` at the start of **every non-dry run** (§5.1). Contract:
+restore the invariant pair *`status = Indexed` ⟺ chunks durably committed* and
+*`index_progress` row ⟹ committed for that index*.
 
-**Nothing calls `recover`** — not `Store::open`, not the `ndex-remote` command layer. Even
-once implemented it would be dead until wired. The corresponding integration test
-(`crash_recovery_resumes_pending_files` in `crates/ndex-remote/tests/integration.rs`) is
-`#[ignore]`d.
+Algorithm:
+1. [`Manifest::recovery_candidates`](../20-store/22-manifest.md) — files holding
+   `index_progress` rows although their status is **not** `Indexed`/`Skipped` (e.g. a
+   previously indexed file reset to `Pending` for reprocessing, or staged `Deleted`,
+   when the run died before/after the FTS commit but before the flip).
+2. If none (the common clean-index case): return without any write.
+3. `fts.delete_file` for each candidate, **then** `fts.commit()` — the purge is made
+   durable *before* step 4, so a crash inside `recover` leaves the candidates detectable
+   and the next run redoes the idempotent purge.
+4. `Manifest::clear_progress` per candidate, and a `tracing::info!` with the count.
 
-### 6.2 Actual v0.1 crash-safety posture (this crate's facts)
+Statuses are left as-is: non-`Indexed` files are picked up by the following walk/diff
+(`Pending`/`FailedTransient` → `Retry`), and Phase 3's delete-before-add makes the
+reprocess safe. USearch/sidecar count repair (PRD §10.3) remains deferred to the
+vector-index follow-up. The full kill−9 harness lives with the `ndex-remote` integration
+tests.
 
-- Manifest/meta writes are per-statement autocommit on WAL connections
-  ([22-manifest](../20-store/22-manifest.md)); FTS writes become durable only at the
-  single end-of-run `fts.commit()` (§4.3).
-- Therefore a crash after a file's `set_status(Indexed)` + `record_progress` but before
-  the run-level `fts.commit()` leaves rows claiming `Indexed` whose FTS documents were
-  never committed. Because `recover` is a no-op and Phase 2 classifies by
-  `(size, mtime_ns)` only, such files are `Unchanged` on the next run and their content is
-  **silently unsearchable until the file itself changes**. This is the main open
-  crash-safety hole (see Divergences); no test exercises it.
+### 6.2 v0.1 crash-safety posture (this crate's facts)
+
+- Manifest/meta writes are per-statement (or per-batch-transaction) autocommit on WAL
+  connections ([22-manifest](../20-store/22-manifest.md)); FTS writes become durable only
+  at a `fts.commit()` — which Phase 3 issues per `BATCH_COMMIT_FILES` batch and at end of
+  run, always **before** the corresponding `mark_indexed`/`mark_deleted` flip (§4.1,
+  §4.3).
+- Crash before a batch's `fts.commit()`: staged tantivy documents are discarded on
+  reopen; the batch's files are still `Pending` → retried. Crash between `fts.commit()`
+  and the flip: files are `Pending` with committed chunks → retried, delete-before-add
+  removes the duplicates; if such a file is meanwhile deleted from disk, the deletion
+  path (or `recover`, via its lingering progress row when it had one) purges the chunks.
+- Known residual window: the **skip transition** purge (§4.2 skip path) clears the
+  progress row *before* the run's next FTS commit; a crash in between leaves a `Skipped`
+  file's stale chunks committed with no progress row to flag them — they persist until
+  the file changes or is deleted. Narrow (requires a previously indexed file turning
+  skippable plus a crash in the window) and self-limiting; accepted for v0.1.
 
 ---
 
@@ -434,12 +534,13 @@ All of the above, including both boundary cases, is locked by the characterizati
 Documented contract (PRD §6.2): a time-boxed Phase 1 + Phase 2 + new-files-only Phase 3
 under a non-blocking (`LOCK_NB`) lock, skipping silently if a writer holds it.
 
-Actual v0.1 body: ignores `budget` entirely and runs
-`Reconciler::run(&ReconcileOptions { only_new: true, .. }, &NullSink)`. Because
-`Reconciler::run` never reads `only_new` (§5.2), this is a **full incremental run**: it
-processes modified files too, has no wall-clock budget, never sets `timed_out`, and does
-no lock probing itself (any non-blocking acquisition would have to happen in the caller
-via `IndexLock::try_acquire` — see
+Actual v0.1 body: ignores `budget` and runs
+`Reconciler::run(&ReconcileOptions { only_new: true, .. }, &NullSink)` — a genuine
+**new-files-only** pass now that `only_new` is honored (§4.1; locked by
+`only_new_processes_new_files_but_not_modified_ones`): modified files and deletions are
+diffed and reported but not processed. Still missing: the wall-clock budget (`timed_out`
+is never set) and lock probing (any non-blocking acquisition would have to happen in the
+caller via `IndexLock::try_acquire` — see
 [21-layout-and-locking](../20-store/21-layout-and-locking.md)).
 
 **Not wired:** nothing in the search path calls `staleness` or `quick_reconcile`. The
@@ -463,81 +564,70 @@ measured.
 
 ## Divergences & open questions
 
+*(Resolved in the crash-safety/retry rework: the two-phase-commit ordering inversion —
+`fts.commit()` now always precedes the batched `mark_indexed`/`mark_deleted` status
+flips (§4.1, §4.3); `recover` is implemented and called at the start of every non-dry
+run (§6.1); transient failures are re-queued each run and promoted to `FailedPermanent`
+at `max_retries` (§3.1, §5.1); extraction errors are now transient per PRD §11.5;
+`max_file_size` is enforced before reading with `Skipped`/`status=5` produced (§4.2);
+`only_new` and `max_file_size` options are honored and the remaining ignored options are
+warned about (§5.2); symlinks escaping the root are no longer followed (§2.1–2.2);
+BLAKE3 is computed per file and persisted via `mark_indexed` (§4.2); dry runs no longer
+write anything (§5.1); the stale characterization-test header is rewritten; the diff doc
+comment no longer claims rayon or hard-link tracking.)*
+
 Code vs PRD:
 
 1. **Walk is sequential.** `walk.rs` uses `WalkBuilder::build()`; PRD §11.1 specifies
    `build_parallel()` with `threads(num_cpus)`. The crate-level doc in `lib.rs` also
    advertises "parallel filesystem traversal", and `WalkOutcome` uses `DashMap` — both
    anticipate parallelism that doesn't exist.
-2. **Diff is sequential and its doc comment is wrong twice.** `diff.rs` claims
-   "Parallelized with rayon" (it is a plain loop; `rayon` is an unused dependency) and
-   claims `(dev, inode)` hard-link tracking (none exists; `hard_link_of` is never
-   written — PRD §11.1 hard-link dedup is entirely missing).
-3. **`unchanged` files are not touched.** `DiffOutcome.unchanged`'s doc comment says
-   "their `last_verified_ns` is refreshed"; no code refreshes it — unchanged files' rows
-   are never written during a run.
+2. **Diff is sequential and hard-link dedup is missing.** `diff.rs` is a plain loop (its
+   doc comment now says so); no `(dev, inode)` tracking exists and `hard_link_of` is
+   never written — PRD §11.1 hard-link dedup is entirely missing.
+3. **`unchanged` files are not touched.** PRD §11.1 refreshes `last_verified_ns` for
+   verified-unchanged files; no code does — unchanged rows are never written during a
+   run (the `DiffOutcome.unchanged` doc comment now states the count-only behavior).
 4. **Directories go nowhere.** Phase 1 collects `dirs`; Phase 2/3 ignore them. PRD §11.1
    requires directory manifest rows (`mime_type='inode/directory'`, `status=1`) and
    directory participation in the diff.
 5. **TOCTOU guard unwired.** `restat_unchanged` exists and is tested, but `process_one`
    never restats after extraction; a file modified mid-extraction is indexed stale and
    marked `Indexed`, violating PRD §11.1's guard.
-6. **Two-phase-commit ordering inverted.** Code: FTS/meta writes → `status=Indexed` →
-   `index_progress` row → (much later) `fts.commit()`. PRD §11.2: index writes → progress
-   rows → `status=1` last. Combined with the once-per-run FTS commit and the no-op
-   `recover`, a crash before `fts.commit()` yields `Indexed` rows with no committed FTS
-   docs, unrecoverable until the file changes (§6.2).
-7. **`recover` is a no-op and is never called** — not from `Store::open` nor from the
-   remote. PRD §11.2 recovery (Pending resweep, `index_progress` re-run, sidecar repair)
-   is deferred; even the hook isn't wired.
-8. **Transient failures are never retried.** A read failure marks `FailedTransient`
-   *after* `upsert_walked` already stored the current `(size, mtime_ns)`, so the next
-   run's diff classifies the file `Unchanged` and skips it. PRD §11.5 requires
-   `status=2` files to be retried each run with promotion to `FailedPermanent` at
-   `max_retries`; neither the requeue nor the promotion exists (nothing reads
-   `fail_count`).
-9. **Extraction errors are immediately permanent.** `process_one` sets `FailedPermanent`
-   on any extraction error/panic; PRD §11.5 classifies extraction errors as transient for
-   the first `max_retries` attempts.
-10. **ENOENT logging/status details.** Read-time ENOENT correctly maps to `Deleted`, but
-    is logged at `debug` (PRD: `INFO` with a specific message). A *stat*-time failure in
-    step 1 writes no status at all and just counts as `failed`.
-11. **`max_file_size` unenforced.** Whole files are slurped with `std::fs::read`
-    regardless of size; PRD §11.5's `status=5` (too large → `Skipped`) is never produced
-    (`ReconcileStats.skipped` is dead).
-12. **Options accepted but ignored:** `verify`, `jobs`, `batch_size`, `no_vectors`,
-    `max_file_size`, `only_new` (§5.2). Consequently `quick_reconcile`'s `only_new: true`
-    does nothing, contradicting its own doc comment ("new-file Phase 3") and the
-    `auto_refresh.index_new_only` default.
-13. **`quick_reconcile` ignores `budget`**: no time-boxing, no `timed_out`, no partial
+6. **Unsupported formats are `Skipped` (5), not `FailedPermanent` (4).** PRD §11.5's
+   failure table lists "unsupported format → status 4", but PRD §4.8 says octet-stream ⇒
+   `status=5` — the PRD is internally inconsistent. Code follows §4.8: `Route::Skip` ⇒
+   `Skipped` with the reason in `error_msg` (§4.2), which also keeps "failed" semantics
+   (something is wrong) distinct from "skipped" (deliberate policy).
+7. **Skip-transition crash window.** A previously indexed file that turns skippable has
+   its progress row cleared before the purge commits; a crash in between leaves stale
+   committed chunks undetectable by `recover` (§6.2). Accepted for v0.1.
+8. **ENOENT logging/status details.** Read-time ENOENT correctly maps to `Deleted`, but
+   is logged at `warn` with a generic message (PRD: `INFO` with a specific message). A
+   *stat*-time failure in step 1 writes no status at all and just counts as `failed`.
+9. **Options accepted but ignored:** `verify`, `jobs`, `batch_size`, `no_vectors`
+   (§5.2) — now surfaced by a once-per-run `tracing::warn`, but still without effect.
+10. **`quick_reconcile` ignores `budget`**: no time-boxing, no `timed_out`, no partial
     warning; and nothing calls it or `staleness` — PRD §6.2 auto-refresh is unwired
     end-to-end (rotational-media detection and the CLI override flags also don't exist).
-14. **Preflight placement.** `preflight_memory` runs *after* the walk (memory already
+11. **Preflight placement.** `preflight_memory` runs *after* the walk (memory already
     consumed) against **total** RAM; PRD §11.1 says before Phase 1, from an estimate,
     against **available** RAM. `preflight_disk` is implemented but never called.
-15. **Symlink containment missing.** Symlinks pointing outside the root are followed;
-    PRD §11.4 forbids that (security-relevant: a link to `/etc` gets indexed).
-16. **BLAKE3 never computed.** `lib.rs` and `process`'s doc comment describe an
-    "extract → BLAKE3/hash → chunk → embed → index" pipeline; no hashing occurs anywhere
-    (`blake3` is an unused dependency; `FileRecord.blake3` stays `NULL`; PRD §4.3
-    walk-time hashing is absent).
-17. **Sensitive-file heuristic (PRD §11.1)** — the post-index WARN for
+12. **BLAKE3 is process-time, not walk-time.** PRD §4.3 describes hashing during the
+    walk; code hashes the whole-file read in `process_one` (§4.2) — cheaper (one read)
+    and only for files that reach processing, but the hash lands only when a file
+    indexes successfully (failed/skipped files keep a NULL or stale `blake3`).
+13. **Sensitive-file heuristic (PRD §11.1)** — the post-index WARN for
     secret/credential-looking names — 📋 no code.
-18. **`--exclude` cannot reach the walk** — no `ReconcileOptions` field, no
+14. **`--exclude` cannot reach the walk** — no `ReconcileOptions` field, no
     `WalkBuilder` override hook (PRD §11.1 ignore-hierarchy item 3).
-19. **`.ignore` files are honored** (via `WalkBuilder::ignore(true)`), an undocumented
+15. **`.ignore` files are honored** (via `WalkBuilder::ignore(true)`), an undocumented
     third ignore source not in the PRD hierarchy.
 
 Code vs itself / housekeeping:
 
-20. **Stale test-file header.** `tests/characterization.rs` opens by saying the phases
-    are `todo!()` and pinned by `#[ignore = "impl pending: PR #3"]` tests; PR #3 has
-    landed, all 10 tests run green, and none are ignored.
-21. **Dry run writes.** `dry_run` still writes a `reconciliation_runs` row via
-    `begin_run` and leaves it unfinished — a "dry" run that mutates the manifest and
-    permanently records a never-finished run.
-22. **Unused dependencies:** `rayon`, `crossbeam-channel`, `memmap2`, `blake3`,
-    `thiserror` are declared in `crates/ndex-reconcile/Cargo.toml` and referenced nowhere
-    in the crate's code.
-23. **Duplicated stat→`WalkEntry` construction** in `walk.rs::file_entry` and
+16. **Unused dependencies:** `rayon`, `crossbeam-channel`, `memmap2`, `thiserror` are
+    declared in `crates/ndex-reconcile/Cargo.toml` and referenced nowhere in the crate's
+    code (`blake3` is now used).
+17. **Duplicated stat→`WalkEntry` construction** in `walk.rs::file_entry` and
     `process.rs::walk_entry` — two copies of the same timestamp math.

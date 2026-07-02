@@ -57,12 +57,12 @@ PRD §12.3's rules, cross-checked against the mechanisms that actually exist in 
 
 | Rule (PRD §12.3) | Compatibility | Enforcing mechanism | Status |
 |---|---|---|---|
-| Add optional fields to existing messages | Compatible | Container-level `#[serde(default)]` on every `message.rs` payload struct (decoder fills missing fields) + serde's default ignore-unknown-fields (no `deny_unknown_fields` anywhere in the crate) | ✅ for `message.rs` structs; 🚧 the core-owned structs embedded in messages lack `#[serde(default)]` — see [53-messages](53-messages.md) Divergences |
-| Add new message variants | Compatible — receiver of an unknown variant replies `Error` | `from_slice` on an unknown variant returns a decode `Err` ✅; translating that into an `Error` reply is the serve loop's job | ⛔ reply behavior unimplemented |
+| Add optional fields to existing messages | Compatible | Container-level `#[serde(default)]` on every `message.rs` payload struct **and** on the core wire-embedded structs (decoder fills missing fields) + serde's default ignore-unknown-fields (no `deny_unknown_fields` anywhere) | ✅ — see [53-messages](53-messages.md) §1 |
+| Add new message variants | Compatible — receiver of an unknown variant replies `Error` | `from_slice` on an unknown variant returns a decode `Err` ✅ (pinned, [53-messages](53-messages.md) §1); translating that into an `Error` reply is the serve loop's job | ⛔ reply behavior unimplemented |
 | Remove required fields / change semantics | Breaking — bump the protocol version | Convention only; nothing mechanical | 📋 |
 | Version bumps rare (years apart) | — | Policy | 📋 |
 
-The `payload_structs_roundtrip_at_their_defaults` characterization test pins the `#[serde(default)]` half of the additive-fields contract (a fully-defaulted struct survives the codec).
+The `payload_structs_roundtrip_at_their_defaults` characterization test pins the `#[serde(default)]` half of the additive-fields contract (a fully-defaulted struct survives the codec), and the cross-version decode tests ([53-messages](53-messages.md) §1) pin both halves against actual old/new-shaped bytes — including a minimal old-client `HandshakeReq` decoding with all newer fields defaulted (`handshake_req_decodes_when_new_fields_are_absent`).
 
 ## 5. Capabilities 🚧
 

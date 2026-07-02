@@ -4,8 +4,9 @@
 //! real function. `todo!()` interfaces get full-assertion contract tests marked
 //! `#[ignore = "impl pending: PR #3"]` so CI stays green while the spec is recorded.
 //!
-//! `ndex-core` is wire-agnostic, so round-trips here go through `serde_json`; the MessagePack
-//! `bin` distinction for [`NdexPath`] is characterized in `ndex-protocol`.
+//! `ndex-core` is wire-agnostic, so round-trips here go through `serde_json`, plus targeted
+//! `rmp-serde` decode tests pinning the additive-evolution `#[serde(default)]` contract; the
+//! MessagePack `bin` distinction for [`NdexPath`] is characterized in `ndex-protocol`.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -85,6 +86,27 @@ fn bytesize_rejects_garbage() {
 }
 
 #[test]
+fn bytesize_rejects_negative_strings() {
+    // The string path agrees with the serde-integer path (previously "-1" silently parsed
+    // to ByteSize(0) via a saturating f64 -> u64 cast).
+    assert_eq!("-1".parse::<ByteSize>().unwrap_err(), "negative byte size");
+    assert!("-1.5KiB".parse::<ByteSize>().is_err());
+    assert!(" -2 GiB ".parse::<ByteSize>().is_err());
+}
+
+#[test]
+fn bytesize_rejects_overflow() {
+    // Values that cannot fit in u64 error instead of saturating to u64::MAX.
+    assert!("18446744073709551616".parse::<ByteSize>().is_err()); // 2^64
+    assert!("100000000tib".parse::<ByteSize>().is_err()); // overflows via the multiplier
+    // Large in-range values still parse (1.8e19 < 2^64, exactly representable in f64).
+    assert_eq!(
+        "18000000000000000000".parse::<ByteSize>().unwrap(),
+        ByteSize(18_000_000_000_000_000_000)
+    );
+}
+
+#[test]
 fn bytesize_serializes_as_raw_u64() {
     // Serde representation is a bare integer count of bytes, not a struct or string.
     assert_eq!(serde_json::to_string(&ByteSize(2048)).unwrap(), "2048");
@@ -133,6 +155,17 @@ fn duration_as_duration_and_serde() {
     assert_eq!(back, d);
     assert!("".parse::<DurationSetting>().is_err());
     assert!("5fortnights".parse::<DurationSetting>().is_err());
+}
+
+#[test]
+fn duration_rejects_overflow() {
+    // The unit multiplication is checked: overflowing u64 seconds errors (previously it
+    // panicked in debug builds and wrapped in release builds).
+    let max = u64::MAX.to_string();
+    assert!(format!("{max}m").parse::<DurationSetting>().is_err());
+    assert!(format!("{max}w").parse::<DurationSetting>().is_err());
+    // Bare seconds at the top of the range still parse.
+    assert_eq!(max.parse::<DurationSetting>().unwrap().secs(), u64::MAX);
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +475,24 @@ fn chunk_and_meta_roundtrip() {
 }
 
 #[test]
+fn meta_structs_msgpack_decode_from_empty_map() {
+    // Container-level #[serde(default)] (additive evolution, PRD §12.3): a payload with
+    // every field missing decodes to the all-None default.
+    assert_eq!(
+        rmp_serde::from_slice::<DocMeta>(&[0x80]).unwrap(),
+        DocMeta::default()
+    );
+    assert_eq!(
+        rmp_serde::from_slice::<MediaMeta>(&[0x80]).unwrap(),
+        MediaMeta::default()
+    );
+    assert_eq!(
+        rmp_serde::from_slice::<ArchiveMeta>(&[0x80]).unwrap(),
+        ArchiveMeta::default()
+    );
+}
+
+#[test]
 fn embedding_dims_reports_length() {
     use half::f16;
     let e = Embedding(vec![f16::from_f32(0.1), f16::from_f32(0.2)]);
@@ -495,6 +546,26 @@ fn identity_schema_gate() {
     assert_eq!(err.exit_code(), 6);
 }
 
+#[test]
+fn identity_load_missing_file_is_index_not_found() {
+    // A missing index.toml is "index not found" (exit 3), not a generic I/O error
+    // (previously NdexError::Io, exit 1).
+    let dir = tempfile::tempdir().unwrap();
+    let err = IndexIdentity::load(&dir.path().join("index.toml")).unwrap_err();
+    assert!(matches!(err, NdexError::IndexNotFound(_)), "{err:?}");
+    assert_eq!(err.exit_code(), 3);
+}
+
+#[test]
+fn identity_load_malformed_toml_is_config_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index.toml");
+    std::fs::write(&path, "this is not = = toml").unwrap();
+    let err = IndexIdentity::load(&path).unwrap_err();
+    assert!(matches!(err, NdexError::Config(_)), "{err:?}");
+    assert_eq!(err.exit_code(), 78);
+}
+
 // ---------------------------------------------------------------------------
 // SearchMode / SearchFilters — variant-name serde + defaults.
 // ---------------------------------------------------------------------------
@@ -524,6 +595,35 @@ fn search_filters_default_is_empty_and_roundtrips() {
         tags: vec!["work".into(), "2024".into()],
         ..SearchFilters::default()
     });
+}
+
+#[test]
+fn search_filters_msgpack_decodes_with_missing_fields() {
+    // Additive-evolution rule (PRD §12.3): a named-map payload from an older peer that
+    // omits fields must still decode, missing fields taking their defaults via the
+    // container-level #[serde(default)]. `tags` is the non-Option field that needs it.
+    #[derive(serde::Serialize)]
+    struct OldFilters {
+        mime: Option<String>,
+        larger: Option<u64>,
+    }
+    let bytes = rmp_serde::to_vec_named(&OldFilters {
+        mime: Some("image/*".into()),
+        larger: Some(1024),
+    })
+    .unwrap();
+    let f: SearchFilters = rmp_serde::from_slice(&bytes).unwrap();
+    assert_eq!(
+        f,
+        SearchFilters {
+            mime: Some("image/*".into()),
+            larger: Some(1024),
+            ..SearchFilters::default()
+        }
+    );
+    // The degenerate case: an entirely empty msgpack map (0x80) decodes to the default.
+    let empty: SearchFilters = rmp_serde::from_slice(&[0x80]).unwrap();
+    assert_eq!(empty, SearchFilters::default());
 }
 
 // ---------------------------------------------------------------------------

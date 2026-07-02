@@ -14,6 +14,6 @@ use ndex_core::error::{NdexError, Result};
 /// Shared handler for the v0.2 command stubs (PRD §13.1).
 pub fn unavailable_v0_2(command: &str) -> Result<()> {
     Err(NdexError::Other(format!(
-        "'ndex {command}' is planned for v0.2 and not yet available."
+        "'ndex-remote {command}' is planned for v0.2 and not yet available."
     )))
 }

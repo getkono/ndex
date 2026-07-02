@@ -12,7 +12,7 @@
 - `crates/ndex-extract/src/lib.rs`
 - Tests: `crates/ndex-extract/tests/characterization.rs`
 
-Extraction is stage 2 of the ingest pipeline: the reconciler ([31-reconcile.md](31-reconcile.md)) reads a file's bytes, calls `mime::detect`, routes through `router(&mime)`, and passes the resulting `Extraction` to the chunker ([33-chunking.md](33-chunking.md)). The crate depends only on `ndex-core`; token counting is injected via `ndex_core::tokens::TokenCounter` so there is no dependency on `ndex-embed`.
+Extraction is stage 2 of the ingest pipeline: the reconciler ([31-reconcile.md](31-reconcile.md)) reads a file's bytes, calls `mime::detect`, routes through `router(&mime)` — a `Route::Skip` result means the file is skipped rather than extracted — and passes the resulting `Extraction` to the chunker ([33-chunking.md](33-chunking.md)). The crate depends only on `ndex-core`; token counting is injected via `ndex_core::tokens::TokenCounter` so there is no dependency on `ndex-embed`.
 
 ---
 
@@ -83,9 +83,15 @@ Pragmatic v0.1 defaults per PRD §4.4: `.h` → C (not C++) — locked in by `kn
 
 ## 3. MIME → extractor routing — ✅ implemented (many targets are stubs)
 
-`crates/ndex-extract/src/extractor.rs` — `router(mime) -> Box<dyn Extractor>`, checked top-to-bottom:
+`crates/ndex-extract/src/extractor.rs` — `router(mime) -> Route`, checked top-to-bottom.
 
-| MIME(s) | Extractor | Extractor status |
+| Item | Shape |
+|---|---|
+| `Route` | `pub enum Route { Extract(Box<dyn Extractor>), Skip }` — the routing decision for a detected MIME type |
+
+`Route::Skip` means no extractor handles the type: the caller must not extract and should record the file as skipped (`status=5`, PRD §4.8). Wiring the skip disposition through the reconciler is owned by [31-reconcile.md](31-reconcile.md).
+
+| MIME(s) | Route | Extractor status |
 |---|---|---|
 | `application/pdf` | `formats::pdf::PdfExtractor` | ⛔ stub |
 | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | `formats::docx::DocxExtractor` | ⛔ stub |
@@ -96,18 +102,19 @@ Pragmatic v0.1 defaults per PRD §4.4: `.h` → C (not C++) — locked in by `kn
 | `application/sql`, `text/x-sql` | `formats::text::SqlExtractor` | 🚧 partial |
 | any `is_archive_mime` (see below) | `formats::archive::ArchiveExtractor` | ⛔ stub |
 | any other `image/*` | `formats::image::ImageExtractor` | ⛔ stub |
-| everything else (catch-all `_`) | `formats::text::PlaintextExtractor` | ✅ implemented |
+| any other `text/*` | `formats::text::PlaintextExtractor` | ✅ implemented |
+| everything else (catch-all `_`), including `application/octet-stream` | **`Route::Skip`** | — |
 
 `is_archive_mime` recognizes exactly: `application/zip`, `application/x-tar`, `application/gzip`, `application/x-gzip`, `application/x-bzip2`, `application/x-xz`, `application/x-7z-compressed`, `application/vnd.rar` (7Z/RAR are metadata-only per PRD §4.6, but still route to `ArchiveExtractor`). Locked in by `archive_mimes_recognized`.
 
 Notes on the dispatch:
 
 - `image/svg+xml` is matched **before** the `image/*` prefix branch, so SVG routes to the HTML/XML text path per PRD §4.8 (searchable `<text>`/`<title>`/`<desc>` content), never to EXIF.
-- There is **no code-MIME branch**: `text/x-rust` and friends hit the catch-all and go to `PlaintextExtractor`. The `router` doc comment claims the reconciler consults `extension_language` for code routing; it does not (see Divergences).
-- `application/octet-stream` also hits the catch-all and gets `PlaintextExtractor` — the router has no "skip" outcome (see Divergences; PRD §4.4 says octet-stream ⇒ `status=5` skipped).
+- There is **no code-MIME branch**: `text/x-rust` and friends match the `text/*` family branch and go to `PlaintextExtractor`. Nothing consults `extension_language` for code routing (see Divergences).
+- `Route::Skip` covers `application/octet-stream`, `video/*`, `audio/*`, `font/*`, and every unrecognized `application/*`. That last group includes some *textual* MIMEs `mime_guess` can emit — notably `application/x-sh` for `.sh` — which previously fell through to plaintext extraction and are now skipped (see Divergences).
 - `LogExtractor` and `CodeExtractor` are never returned by the router; they are currently unreachable in production code.
 
-That every branch constructs without panicking (even where `extract()` is `todo!()`) is locked in by `router_constructs_for_every_branch_without_panicking`.
+Locked in by `router_dispatches_supported_mimes_and_skips_the_rest` (`tests/characterization.rs`): every extractor branch constructs without panicking (even where `extract()` is `todo!()`), and octet-stream / `video/mp4` / `font/woff2` yield `Route::Skip`. The in-module tests `router_dispatches_supported_mimes` and `router_skips_mimes_with_no_extractor` duplicate this.
 
 ## 4. Encoding detection, transcoding, normalization — ✅ implemented
 
@@ -160,13 +167,13 @@ Locked in by `language_detection_and_short_text_guard` (asserts `MIN_DETECT_LEN 
 |---|---|
 | `MEMBER_DELIM` | `b"!/"` — the JAR-convention delimiter between archive path and member path |
 | `member_path(archive, member)` | Byte-concatenation `<archive>!/<member>` returning a new `NdexPath` |
-| `is_unsafe_member_path(member)` | `true` iff the member starts with `/`, contains `../`, contains `..\`, or contains NUL |
+| `is_unsafe_member_path(member)` | `true` iff the member starts with `/`, contains NUL, or has any `/`- or `\`-separated component equal to `..` — catches `../x`, `x/../y`, trailing `x/..`, bare `..`, and `dir\..\x`; a `..` embedded in a name (`notes..txt`, `..hidden`) is safe |
 | `exceeds_ratio(compressed, decompressed, limit)` | `decompressed / max(compressed, 1) > limit` — integer (floor) division; the ratio must *strictly* exceed `limit`; zero compressed size is clamped to 1, so ratio checks never divide by zero |
 | `with_panic_isolation(f)` | `std::panic::catch_unwind` (with `AssertUnwindSafe`); a panic maps to `NdexError::ExtractionTransient("archive extractor panicked")`. Does not protect against `abort()` or stack overflow in native code |
 
 The numeric limits (`compression_ratio_limit`, `max_archive_total_size`, `max_archive_members`, `max_archive_depth`) live in the `[archive]` config section — values owned by [13-config.md](../10-core/13-config.md).
 
-Locked in by `unsafe_member_paths_rejected` (including the Windows-style `dir\..\x` case), `compression_ratio_and_member_path` (including the `(0, 0)` divide-by-zero guard), and `panic_isolation_catches_and_passes_through`. The reconciler wraps **all** extraction (not just archives) in `with_panic_isolation` — see [31-reconcile.md](31-reconcile.md).
+Locked in by `unsafe_member_paths_rejected` (including bare/trailing `..` components, the Windows-style `dir\..\x` case, and the safe `notes..txt` counterexample), `compression_ratio_and_member_path` (including the `(0, 0)` divide-by-zero guard), and `panic_isolation_catches_and_passes_through`. The reconciler wraps **all** extraction (not just archives) in `with_panic_isolation` — see [31-reconcile.md](31-reconcile.md).
 
 Not implemented here (📋 planned, per PRD §4.9): total-size / member-count / depth enforcement loops, ratio checks "every 1 MiB of output" during streaming, per-member error isolation, `extraction_status='partial'` bookkeeping. These require the archive extractor (§8.8), which is a stub.
 
@@ -243,18 +250,17 @@ The grammar map `language_for(lang) -> Option<tree_sitter::Language>` is ✅ imp
 
 ## 9. Test coverage summary
 
-`crates/ndex-extract/tests/characterization.rs` exercises live: MIME chain, NUL heuristic + `TEXT_SNIFF_BYTES`, known-filename/extension tables, BOM/NFC, UTF-16 decode + UTF-8 passthrough, language detection + `MIN_DETECT_LEN`, member-path safety + ratio + panic isolation, archive-MIME set, router totality, JSON variant classification, plaintext block extraction, and the grammar map. Unit tests inside the modules duplicate most of these. **Never tested:** the chardetng legacy-encoding fallback (step 4 of §4.2), every ⛔ extractor, and any end-to-end archive behavior.
+`crates/ndex-extract/tests/characterization.rs` exercises live: MIME chain, NUL heuristic + `TEXT_SNIFF_BYTES`, known-filename/extension tables, BOM/NFC, UTF-16 decode + UTF-8 passthrough, language detection + `MIN_DETECT_LEN`, member-path safety + ratio + panic isolation, archive-MIME set, router dispatch and skip, JSON variant classification, plaintext block extraction, and the grammar map. Unit tests inside the modules duplicate most of these. **Never tested:** the chardetng legacy-encoding fallback (step 4 of §4.2), every ⛔ extractor, and any end-to-end archive behavior.
 
 ## Divergences & open questions
 
-1. **`application/octet-stream` is plaintext-extracted, not skipped.** PRD §4.4/§4.8: unidentifiable binary ⇒ `status=5` (skipped). The router's catch-all sends it to `PlaintextExtractor`, and the reconciler (`crates/ndex-reconcile/src/process.rs`) routes unconditionally — so arbitrary binary is lossily decoded and indexed as garbage text. The skip decision exists nowhere.
-2. **Code routing is fiction.** The `router` doc comment says code MIMEs route here and "the reconciler also consults `crate::mime::extension_language`"; there is no code branch in `router`, the reconciler never calls `extension_language`, and `CodeExtractor` is unreachable. Shebang detection (PRD §4.4 step 2) has no code at all.
-3. **Grammar set: 3 vs ~32.** PRD §4.4 lists ~32 bundled tree-sitter grammars; only Rust/Python/JavaScript are bundled. `extension_language` emits `typescript`/`c`/`cpp`/`go`/`bash` which `language_for` cannot resolve. PRD's `.m` → Objective-C default is absent from the extension table.
-4. **`CMakeLists.txt` known-filename entry is dead in `detect`.** `mime_guess` resolves `.txt` → `text/plain` at stage 2, so stage 3 never sees it; the direct-helper test passes anyway. Either reorder the chain or drop the entry.
-5. **No chardetng confidence gate, no transcode logging.** PRD §4.8 requires a confidence threshold with lossy fallback, DEBUG logs for transcodes, and WARN logs for U+FFFD replacements; `decode_to_utf8` uses the guess unconditionally and logs nothing. The magic-vs-extension disagreement DEBUG log (PRD §4.4) is also absent.
-6. **Language codes are ISO 639-3, `doc_meta.lang` expects ISO 639-1.** Acknowledged in the `lang.rs` doc comment; unresolved. Also `MIN_DETECT_LEN` measures bytes, so 20 *bytes* of CJK is ~7 characters — the guard is looser than "20 characters" for multibyte scripts.
-7. **`is_unsafe_member_path` misses bare `..` components.** `..` alone or a trailing `foo/..` contains neither `../` nor `..\` and passes the check. Exploitability depends on how member paths are eventually joined, but the guard as written does not match PRD §4.9's "paths containing `../` (path traversal)" intent for all traversal spellings.
-8. **`exceeds_ratio` floor-division boundary.** With integer division, `decompressed = limit × compressed` does *not* exceed (`200:1` exactly passes; `200×c + c` needed to trip). PRD's "200:1 per member" limit is thus effectively "> 200:1 after floor". Also every §4.9 enforcement loop (total size, member count, depth, 1-MiB ratio cadence) is unimplemented pending the archive extractor.
-9. **Block byte offsets are normalized-text-relative.** After transcoding/BOM-stripping/NFC, `Block.byte_start`/`byte_end` (and therefore chunk offsets, [33-chunking.md](33-chunking.md)) do not map back to raw file bytes. No consumer or test defines which coordinate space is authoritative.
-10. **Stale test-header comment.** `crates/ndex-extract/tests/characterization.rs` says transcoding/routing/chunking contracts are pinned by `#[ignore = "impl pending: PR #3"]` tests; those tests are live and un-ignored (the implementations landed in PR #3).
-11. **`text/markdown` never emerges from `detect` in practice for `.md`** — `mime_guess` maps `.md`/`.markdown` to `text/markdown`, so this works; but files whose Markdown-ness is only knowable by content (extensionless `README`) classify as `text/plain` and skip the Markdown extractor. Consistent with PRD, noted for completeness.
+1. **Code routing does not exist.** There is no code-MIME branch in `router` — code types like `text/x-rust` are plaintext-extracted via the `text/*` family branch — the reconciler never calls `extension_language`, and `CodeExtractor` is unreachable. Shebang detection (PRD §4.4 step 2) has no code at all. Relatedly, script extensions whose `mime_guess` MIME is not `text/*` (e.g. `.sh` → `application/x-sh`) now hit the `Route::Skip` catch-all: such files are skipped rather than indexed until code routing lands.
+2. **Grammar set: 3 vs ~32.** PRD §4.4 lists ~32 bundled tree-sitter grammars; only Rust/Python/JavaScript are bundled. `extension_language` emits `typescript`/`c`/`cpp`/`go`/`bash` which `language_for` cannot resolve. PRD's `.m` → Objective-C default is absent from the extension table.
+3. **`CMakeLists.txt` known-filename entry is dead in `detect`.** `mime_guess` resolves `.txt` → `text/plain` at stage 2, so stage 3 never sees it; the direct-helper test passes anyway. Either reorder the chain or drop the entry.
+4. **No chardetng confidence gate, no transcode logging.** PRD §4.8 requires a confidence threshold with lossy fallback, DEBUG logs for transcodes, and WARN logs for U+FFFD replacements; `decode_to_utf8` uses the guess unconditionally and logs nothing. The magic-vs-extension disagreement DEBUG log (PRD §4.4) is also absent.
+5. **Language codes are ISO 639-3, `doc_meta.lang` expects ISO 639-1.** Acknowledged in the `lang.rs` doc comment; unresolved. Also `MIN_DETECT_LEN` measures bytes, so 20 *bytes* of CJK is ~7 characters — the guard is looser than "20 characters" for multibyte scripts.
+6. **`exceeds_ratio` floor-division boundary.** With integer division, `decompressed = limit × compressed` does *not* exceed (`200:1` exactly passes; `200×c + c` needed to trip). PRD's "200:1 per member" limit is thus effectively "> 200:1 after floor". Also every §4.9 enforcement loop (total size, member count, depth, 1-MiB ratio cadence) is unimplemented pending the archive extractor.
+7. **Block byte offsets are normalized-text-relative.** After transcoding/BOM-stripping/NFC, `Block.byte_start`/`byte_end` (and therefore chunk offsets, [33-chunking.md](33-chunking.md)) do not map back to raw file bytes. No consumer or test defines which coordinate space is authoritative.
+8. **`text/markdown` never emerges from `detect` in practice for `.md`** — `mime_guess` maps `.md`/`.markdown` to `text/markdown`, so this works; but files whose Markdown-ness is only knowable by content (extensionless `README`) classify as `text/plain` and skip the Markdown extractor. Consistent with PRD, noted for completeness.
+
+*Resolved here (2026-07):* the former octet-stream-to-plaintext divergence (router now returns `Route::Skip`, §3; reconciler wiring of `status=5` is owned by [31-reconcile.md](31-reconcile.md)), the `is_unsafe_member_path` bare-`..` gap (§6), and the stale characterization-test header comment.

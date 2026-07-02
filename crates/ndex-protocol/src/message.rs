@@ -214,7 +214,7 @@ pub struct IndexCompleteData {
 }
 
 /// Detailed file info (PRD §12.7). `status` is a raw `u8` on the wire (PRD §12.7);
-/// `blake3` is raw bytes.
+/// `blake3` is raw bytes, wire-encoded as MessagePack bin via `serde_bytes`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FileInfo {
@@ -224,6 +224,7 @@ pub struct FileInfo {
     pub mtime_ns: i64,
     pub ctime_ns: i64,
     pub mime: Option<String>,
+    #[serde(with = "serde_bytes")]
     pub blake3: Option<Vec<u8>>,
     pub status: u8,
     pub fail_count: u32,
@@ -272,12 +273,15 @@ pub struct StatsResultData {
 }
 
 /// A file whose stored hash did not match its recomputed hash (PRD §12.7).
+/// Hashes are raw bytes, wire-encoded as MessagePack bin via `serde_bytes`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CorruptedFile {
     pub file_id: u64,
     pub path: NdexPath,
+    #[serde(with = "serde_bytes")]
     pub stored_hash: Vec<u8>,
+    #[serde(with = "serde_bytes")]
     pub actual_hash: Vec<u8>,
 }
 

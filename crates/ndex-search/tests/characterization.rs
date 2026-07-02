@@ -1,8 +1,10 @@
 //! Characterization tests for the public `ndex-search` interface.
 //!
-//! `mode::resolve` and the `fuse` math are REAL and exercised live. `query::embed_query` and
-//! `search::run` are `todo!()`; their contracts are pinned by `#[ignore = "impl pending: PR #3"]`
-//! tests that still compile against the real signatures.
+//! Everything here is REAL and exercised live: `mode::resolve` and the `fuse` math as pure
+//! functions, `query::embed_query` via a recording fake `Embed`, and `search::run` end-to-end
+//! over a `Store` fixture populated through the FTS writer. v0.1 retrieval is FTS-only;
+//! semantic/hybrid retrieval is a follow-up (explicit `semantic` with an empty vector index
+//! returns zero hits with a warning — PRD §16.3).
 
 use std::sync::Mutex;
 
@@ -91,33 +93,58 @@ fn score_explain_defaults_to_all_absent() {
 }
 
 // ---------------------------------------------------------------------------
-// Mode resolution (PRD §10.7) — exhaustive heuristic table.
+// Mode resolution (PRD §10.7, §16.3) — exhaustive heuristic table + warnings.
 // ---------------------------------------------------------------------------
+
+/// Exact warning strings (owned by `mode.rs`, pinned here — the CLI prints them to stderr).
+const WARN_SEMANTIC: &str = "Vector index is empty; semantic search returned no results. Run \
+     `ndex index` to build it, or use `--mode auto` to fall back to full-text search.";
+const WARN_HYBRID: &str = "Vector index is empty; hybrid search fell back to full-text only. \
+     Run `ndex index` to enable semantic retrieval.";
+const WARN_AUTO: &str = "Vector index is empty; semantic ranking skipped (results are full-text \
+     only). Run `ndex index` to enable it.";
 
 #[test]
 fn explicit_modes_pass_through_when_vectors_present() {
     for m in [SearchMode::Fts, SearchMode::Semantic, SearchMode::Hybrid] {
-        assert_eq!(resolve("anything", m, false), m);
+        let r = resolve("anything", m, false);
+        assert_eq!(r.mode, m);
+        assert!(r.warnings.is_empty());
     }
 }
 
 #[test]
-fn semantic_and_hybrid_fall_back_to_fts_without_vectors() {
-    assert_eq!(resolve("x", SearchMode::Semantic, true), SearchMode::Fts);
-    assert_eq!(resolve("x", SearchMode::Hybrid, true), SearchMode::Fts);
-    // Explicit FTS is unaffected.
-    assert_eq!(resolve("x", SearchMode::Fts, true), SearchMode::Fts);
+fn semantic_without_vectors_stays_semantic_with_warning() {
+    // PRD §16.3: explicit semantic never silently serves BM25 — it stays `Semantic`
+    // (zero hits, see `run_explicit_semantic_without_vectors_returns_zero_hits`) and warns.
+    let r = resolve("x", SearchMode::Semantic, true);
+    assert_eq!(r.mode, SearchMode::Semantic);
+    assert_eq!(r.warnings, vec![WARN_SEMANTIC.to_owned()]);
+}
+
+#[test]
+fn hybrid_without_vectors_falls_back_to_fts_with_warning() {
+    let r = resolve("x", SearchMode::Hybrid, true);
+    assert_eq!(r.mode, SearchMode::Fts);
+    assert_eq!(r.warnings, vec![WARN_HYBRID.to_owned()]);
+    // Explicit FTS is unaffected — no fallback, no warning.
+    let fts = resolve("x", SearchMode::Fts, true);
+    assert_eq!(fts.mode, SearchMode::Fts);
+    assert!(fts.warnings.is_empty());
 }
 
 #[test]
 fn auto_short_keyword_queries_pick_fts() {
-    assert_eq!(resolve("blake3", SearchMode::Auto, false), SearchMode::Fts);
     assert_eq!(
-        resolve("config.toml", SearchMode::Auto, false),
+        resolve("blake3", SearchMode::Auto, false).mode,
         SearchMode::Fts
     );
     assert_eq!(
-        resolve("usearch hnsw", SearchMode::Auto, false),
+        resolve("config.toml", SearchMode::Auto, false).mode,
+        SearchMode::Fts
+    );
+    assert_eq!(
+        resolve("usearch hnsw", SearchMode::Auto, false).mode,
         SearchMode::Fts
     );
 }
@@ -125,47 +152,48 @@ fn auto_short_keyword_queries_pick_fts() {
 #[test]
 fn auto_phrases_and_operators_pick_fts() {
     assert_eq!(
-        resolve("\"exact phrase\"", SearchMode::Auto, false),
+        resolve("\"exact phrase\"", SearchMode::Auto, false).mode,
         SearchMode::Fts
     );
     assert_eq!(
-        resolve("invoice AND 2024", SearchMode::Auto, false),
+        resolve("invoice AND 2024", SearchMode::Auto, false).mode,
         SearchMode::Fts
     );
-    assert_eq!(resolve("a OR b", SearchMode::Auto, false), SearchMode::Fts);
     assert_eq!(
-        resolve("mime:application/pdf", SearchMode::Auto, false),
+        resolve("a OR b", SearchMode::Auto, false).mode,
+        SearchMode::Fts
+    );
+    assert_eq!(
+        resolve("mime:application/pdf", SearchMode::Auto, false).mode,
         SearchMode::Fts
     );
 }
 
 #[test]
 fn auto_natural_language_picks_hybrid() {
-    assert_eq!(
-        resolve(
-            "how do I configure the embedding model",
-            SearchMode::Auto,
-            false
-        ),
-        SearchMode::Hybrid
+    let r = resolve(
+        "how do I configure the embedding model",
+        SearchMode::Auto,
+        false,
     );
+    assert_eq!(r.mode, SearchMode::Hybrid);
+    assert!(r.warnings.is_empty());
     // Short but stop-word present ⇒ natural-language intent ⇒ hybrid.
     assert_eq!(
-        resolve("what is blake3", SearchMode::Auto, false),
+        resolve("what is blake3", SearchMode::Auto, false).mode,
         SearchMode::Hybrid
     );
 }
 
 #[test]
-fn auto_with_empty_vectors_always_picks_fts() {
-    assert_eq!(
-        resolve(
-            "how do I configure the embedding model",
-            SearchMode::Auto,
-            true
-        ),
-        SearchMode::Fts
+fn auto_with_empty_vectors_always_picks_fts_with_warning() {
+    let r = resolve(
+        "how do I configure the embedding model",
+        SearchMode::Auto,
+        true,
     );
+    assert_eq!(r.mode, SearchMode::Fts);
+    assert_eq!(r.warnings, vec![WARN_AUTO.to_owned()]);
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +207,7 @@ fn search_outcome_default_is_empty_auto() {
     assert_eq!(o.total, 0);
     assert_eq!(o.mode, SearchMode::Auto);
     assert!(!o.truncated);
+    assert!(o.warnings.is_empty());
 }
 
 #[test]
@@ -197,7 +226,7 @@ fn hit_is_constructible_and_comparable() {
 }
 
 // ---------------------------------------------------------------------------
-// todo!() contracts (PR #3 targets).
+// Query embedding (PRD §10.7) — via a recording fake `Embed`.
 // ---------------------------------------------------------------------------
 
 /// An `Embed` impl that records the exact strings it was asked to embed.
@@ -222,16 +251,158 @@ fn embed_query_applies_asymmetric_prefix() {
     assert_eq!(seen.as_slice(), &["query: quarterly earnings".to_string()]);
 }
 
-#[test]
-#[ignore = "impl pending: PR #3"]
-fn run_returns_ranked_hits_in_resolved_mode() {
-    // Spec: over a populated index, `run` resolves the mode, retrieves, fuses, applies the limit,
-    // and reports the resolved mode + truncation. Needs Store::create/open (also todo).
+// ---------------------------------------------------------------------------
+// End-to-end `run` over a real store (PRD §10.7, §16.3) — totals, pagination,
+// warnings, semantic zero-hit policy. FTS-only in v0.1.
+// ---------------------------------------------------------------------------
+
+fn test_identity() -> ndex_core::identity::IndexIdentity {
+    use ndex_core::identity::{
+        EmbeddingIdentity, FtsIdentity, Hashing, Identity, IndexIdentity, SCHEMA_VERSION,
+    };
+    IndexIdentity {
+        identity: Identity {
+            schema_version: SCHEMA_VERSION,
+            created_by: "test".into(),
+            created_at: "2026-06-19T00:00:00Z".into(),
+        },
+        embedding: EmbeddingIdentity {
+            model_name: ndex_core::constants::DEFAULT_MODEL.into(),
+            model_hash: "abc".into(),
+            dimensions: 768,
+            mrl_dimensions: 256,
+            vector_scalar: "f16".into(),
+            hnsw_m: 32,
+            hnsw_ef_construction: 200,
+        },
+        hashing: Hashing {
+            algorithm: "blake3".into(),
+        },
+        fts: FtsIdentity {
+            tokenizer_version: 1,
+        },
+    }
+}
+
+fn chunk(chunk_ord: u32, text: &str) -> ndex_core::model::Chunk {
+    ndex_core::model::Chunk {
+        file_id: 0,
+        chunk_ord,
+        byte_start: 0,
+        byte_end: text.len() as u64,
+        block_type: ndex_core::model::BlockType::Paragraph,
+        text: text.into(),
+    }
+}
+
+fn fts_meta(path_text: &str) -> ndex_store::fts::FtsFileMeta<'_> {
+    ndex_store::fts::FtsFileMeta {
+        mime: "text/plain",
+        lang: Some("eng"),
+        path_text,
+        size: 1024,
+        mtime_ns: 1_700_000_000_000_000_000,
+        title: None,
+    }
+}
+
+/// A store whose FTS index holds `n` single-chunk files all matching the term `needle`.
+/// The vector index is absent (v0.1), so `vectors_empty` is true inside `run`.
+fn needle_store(n: i64) -> (tempfile::TempDir, ndex_store::Store) {
     let tmp = tempfile::tempdir().unwrap();
-    let store = ndex_store::Store::open(tmp.path()).unwrap();
+    let mut store = ndex_store::Store::create(
+        tmp.path(),
+        test_identity(),
+        ndex_core::config::Config::default(),
+    )
+    .unwrap();
+    for id in 1..=n {
+        store
+            .fts
+            .add_chunk(id, &chunk(0, "needle in a haystack"), &fts_meta("f.txt"))
+            .unwrap();
+    }
+    store.fts.commit().unwrap();
+    (tmp, store)
+}
+
+#[test]
+fn run_reports_true_total_and_truncation() {
+    let (_tmp, store) = needle_store(5);
     let filters = SearchFilters::default();
-    let outcome =
-        ndex_search::run(&store, None, "hello", SearchMode::Fts, &filters, 10, 0).unwrap();
-    assert!(outcome.hits.len() <= 10);
-    assert_eq!(outcome.mode, SearchMode::Fts);
+
+    // First page: `total` is the corpus-wide match count, not the fetched window.
+    let out = ndex_search::run(&store, None, "needle", SearchMode::Fts, &filters, 2, 0).unwrap();
+    assert_eq!(out.hits.len(), 2);
+    assert_eq!(out.total, 5);
+    assert!(out.truncated);
+    assert_eq!(out.mode, SearchMode::Fts);
+    assert!(out.warnings.is_empty()); // explicit FTS never warns
+
+    // Last page: offset + hits.len() == total ⇒ not truncated.
+    let last = ndex_search::run(&store, None, "needle", SearchMode::Fts, &filters, 2, 4).unwrap();
+    assert_eq!(last.hits.len(), 1);
+    assert_eq!(last.total, 5);
+    assert!(!last.truncated);
+
+    // Offset past the end: empty page, real total, nothing further.
+    let past = ndex_search::run(&store, None, "needle", SearchMode::Fts, &filters, 2, 10).unwrap();
+    assert!(past.hits.is_empty());
+    assert_eq!(past.total, 5);
+    assert!(!past.truncated);
+}
+
+#[test]
+fn run_with_zero_limit_is_a_count_query() {
+    let (_tmp, store) = needle_store(3);
+    let filters = SearchFilters::default();
+
+    let out = ndex_search::run(&store, None, "needle", SearchMode::Fts, &filters, 0, 0).unwrap();
+    assert!(out.hits.is_empty());
+    assert_eq!(out.total, 3);
+    assert!(out.truncated); // matches exist beyond the (empty) page
+
+    let none = ndex_search::run(&store, None, "nomatch", SearchMode::Fts, &filters, 0, 0).unwrap();
+    assert!(none.hits.is_empty());
+    assert_eq!(none.total, 0);
+    assert!(!none.truncated);
+}
+
+#[test]
+fn run_explicit_semantic_without_vectors_returns_zero_hits() {
+    let (_tmp, store) = needle_store(3);
+    let filters = SearchFilters::default();
+    let out = ndex_search::run(
+        &store,
+        None,
+        "needle",
+        SearchMode::Semantic,
+        &filters,
+        10,
+        0,
+    )
+    .unwrap();
+    // PRD §16.3: no silent BM25 substitution — the mode stays honest and nothing runs.
+    assert_eq!(out.mode, SearchMode::Semantic);
+    assert!(out.hits.is_empty());
+    assert_eq!(out.total, 0);
+    assert!(!out.truncated);
+    assert_eq!(out.warnings, vec![WARN_SEMANTIC.to_owned()]);
+}
+
+#[test]
+fn run_auto_and_hybrid_without_vectors_serve_fts_with_warning() {
+    let (_tmp, store) = needle_store(2);
+    let filters = SearchFilters::default();
+
+    let auto = ndex_search::run(&store, None, "needle", SearchMode::Auto, &filters, 10, 0).unwrap();
+    assert_eq!(auto.mode, SearchMode::Fts);
+    assert_eq!(auto.hits.len(), 2);
+    assert_eq!(auto.warnings, vec![WARN_AUTO.to_owned()]);
+
+    let hybrid =
+        ndex_search::run(&store, None, "needle", SearchMode::Hybrid, &filters, 10, 0).unwrap();
+    assert_eq!(hybrid.mode, SearchMode::Fts);
+    assert_eq!(hybrid.hits.len(), 2);
+    assert_eq!(hybrid.warnings, vec![WARN_HYBRID.to_owned()]);
 }

@@ -22,7 +22,13 @@ All values are encoded via the named-mode codec ([51-framing](51-framing.md)); t
 
 **Struct encoding.** Every payload struct serializes as a MessagePack map with field-name `str` keys. **Every field is always written** — there is no `skip_serializing_if` anywhere; `Option::None` is written as `nil`. Field order is declaration order (not relied upon: decoding is by key).
 
-**Forward compatibility.** Every struct defined in `message.rs` carries container-level `#[serde(default)]`: a decoder fills any missing field with its `Default` value, and serde ignores unknown map keys (no `deny_unknown_fields`). Pinned by `payload_structs_roundtrip_at_their_defaults` (all 23 structs at their defaults). The compatibility rules this serves are owned by [52-handshake](52-handshake.md). Core-owned structs embedded in messages do **not** all carry it — see Divergences.
+**Forward compatibility.** Every struct defined in `message.rs` carries container-level `#[serde(default)]`, and the core wire-embedded structs (`SearchFilters`, `DocMeta`, `MediaMeta`, `ArchiveMeta` — owned by [15-search-and-progress-types](../10-core/15-search-and-progress-types.md) and [11-data-model](../10-core/11-data-model.md)) carry it too: a decoder fills any missing field with its `Default` value, and serde ignores unknown map keys (no `deny_unknown_fields` anywhere). This — together with the struct-map codec ([51-framing](51-framing.md) §6) — is what implements PRD §12.3's additive-fields rule ([52-handshake](52-handshake.md) §4). Pinned by:
+
+- `payload_structs_roundtrip_at_their_defaults` — all 23 `message.rs` structs at their defaults;
+- `decode_ignores_unknown_extra_field` — a payload map carrying an unknown extra key decodes, key skipped;
+- `decode_fills_missing_defaulted_field` — a payload map missing a defaulted field decodes, field filled;
+- `handshake_req_decodes_when_new_fields_are_absent` — a minimal old-client `HandshakeReq` (only `min_protocol`/`max_protocol`) decodes with all other fields defaulted;
+- `unknown_enum_variant_is_a_decode_error` — pinned **limit** of additive evolution: an unknown variant of any wire enum (message enums and unit-only utility enums alike) is a decode `Err`, not a skip. New variants are not additive; they require a protocol-version bump or capability gate ([52-handshake](52-handshake.md) §4), and the serve loop is expected to answer an undecodable frame with `Error`.
 
 ## 2. Wire encoding conventions ✅
 
@@ -35,7 +41,7 @@ All values are encoded via the named-mode codec ([51-framing](51-framing.md)); t
 | `Vec<String>` | array of str | empty vec → empty array, still written |
 | `Option<T>` | nil, or T's encoding | key always present |
 | `NdexPath` | **bin** (raw bytes; `serialize_bytes` in `crates/ndex-core/src/path.rs`) | never a lossy string; non-UTF-8 bytes survive — pinned via `sample_path()` containing `0xff` in every path-bearing message. Decoder also tolerates str/array input (its visitor accepts bytes, str, and seq). Type semantics: [12-paths](../10-core/12-paths.md) |
-| `Vec<u8>` (hash fields) | **array of ints** — *not* bin | serde has no `Vec<u8>` specialization and no `serde_bytes` is used; applies to `FileInfo.blake3`, `CorruptedFile.stored_hash` / `actual_hash`. See Divergences |
+| `Vec<u8>` (hash fields) | **bin** via `#[serde(with = "serde_bytes")]` | applies to `FileInfo.blake3` (`Option`, `Some` = bin directly) and `CorruptedFile.stored_hash` / `actual_hash`. Byte-pinned: field key then `c4 20` + 32 raw bytes for a 32-byte hash (`hash_fields_encode_as_msgpack_bin`). The decoder also tolerates the legacy int-array encoding that pre-`serde_bytes` peers produced — `serde_bytes` accepts seq input (`hash_fields_decode_from_legacy_int_array`) |
 | unit-only enums | variant-name str | see §1 |
 | nested structs | map | see §1 |
 
@@ -110,7 +116,7 @@ All structs: container-level `#[serde(default)]`, `PartialEq`. Six are not `Eq` 
 
 ### Handshake payloads (PRD §12.3, §12.7)
 
-**`TerminalCaps`** — client terminal capabilities, sent so the server *could* tailor output (but see Divergences #6).
+**`TerminalCaps`** — client terminal capabilities, sent so the server *could* tailor output (but see Divergences #4).
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -149,10 +155,10 @@ All structs: container-level `#[serde(default)]`, `PartialEq`. Six are not `Eq` 
 |---|---|---|
 | `query` | `String` | FTS syntax or natural language |
 | `mode` | `SearchMode` | Requested mode ([15-search-and-progress-types](../10-core/15-search-and-progress-types.md)); str on wire |
-| `filters` | `SearchFilters` | Nested map; fields owned by [15-search-and-progress-types](../10-core/15-search-and-progress-types.md). Only its `tags` field has `#[serde(default)]` — see Divergences #4 |
+| `filters` | `SearchFilters` | Nested map; fields owned by [15-search-and-progress-types](../10-core/15-search-and-progress-types.md); container-level `#[serde(default)]` (§1) |
 | `limit` | `u32` | Max hits to return (CLI default owned by [61-client-cli](../60-interfaces/61-client-cli.md)) |
 | `offset` | `u32` | Pagination offset |
-| `format` | `OutputFormat` | Client's chosen rendering format (see Divergences #6) |
+| `format` | `OutputFormat` | Client's chosen rendering format (see Divergences #4) |
 | `explain` | `bool` | Requests per-component scores (`score_fts`/`score_vec`) in hits |
 
 **`IndexOptions`** — payload of `IndexRequest`; mirrors the `ndex index` flags ([61-client-cli](../60-interfaces/61-client-cli.md)).
@@ -193,7 +199,7 @@ All structs: container-level `#[serde(default)]`, `PartialEq`. Six are not `Eq` 
 
 | Field | Type | Meaning |
 |---|---|---|
-| `file_id` | `u64` | Manifest file id (note: the manifest row type uses `i64` — Divergences #5) |
+| `file_id` | `u64` | Manifest file id (note: the manifest row type uses `i64` — Divergences #3) |
 | `chunk_ord` | `u32` | Chunk ordinal within the file |
 | `path` | `NdexPath` | bin |
 | `score` | `f32` | Normalized `[0,1]` for display |
@@ -238,13 +244,13 @@ All structs: container-level `#[serde(default)]`, `PartialEq`. Six are not `Eq` 
 | `size` | `u64` | bytes |
 | `mtime_ns` / `ctime_ns` | `i64` | Unix ns |
 | `mime` | `Option<String>` | |
-| `blake3` | `Option<Vec<u8>>` | 32-byte content hash — wire-encoded as an **int array**, not bin (§2) |
+| `blake3` | `Option<Vec<u8>>` | 32-byte content hash — wire-encoded as **bin** via `serde_bytes` (§2) |
 | `status` | `u8` | **Raw `u8` on the wire** (PRD §12.7); value meanings are the `FileStatus` lifecycle owned by [11-data-model](../10-core/11-data-model.md) |
 | `fail_count` | `u32` | Consecutive extraction failures |
 | `error_msg` | `Option<String>` | Last failure message |
 | `tags` | `Vec<String>` | |
-| `doc_meta` | `Option<DocMeta>` | Nested map; fields owned by [11-data-model](../10-core/11-data-model.md); no `#[serde(default)]` (Divergences #4) |
-| `media_meta` | `Option<MediaMeta>` | Nested map; ditto — and it carries a `lens` field absent from PRD §12.7 (Divergences #3) |
+| `doc_meta` | `Option<DocMeta>` | Nested map; fields owned by [11-data-model](../10-core/11-data-model.md); container-level `#[serde(default)]` (§1) |
+| `media_meta` | `Option<MediaMeta>` | Nested map; ditto — and it carries a `lens` field absent from PRD §12.7 (Divergences #2) |
 | `chunk_count` | `u32` | |
 | `in_fts` / `in_vectors` | `bool` | Presence in each index component |
 
@@ -270,7 +276,7 @@ All structs: container-level `#[serde(default)]`, `PartialEq`. Six are not `Eq` 
 |---|---|---|
 | `file_id` | `u64` | |
 | `path` | `NdexPath` | bin |
-| `stored_hash` / `actual_hash` | `Vec<u8>` | int arrays on the wire (§2) |
+| `stored_hash` / `actual_hash` | `Vec<u8>` | **bin** on the wire via `serde_bytes` (§2) |
 
 **`VerifyResultData`** — `checked: u64` + `corrupted: Vec<CorruptedFile>`.
 
@@ -315,17 +321,21 @@ The engine-side twin (`ProgressUpdate`/`ProgressKind`, owned by [15-search-and-p
 - Round-trip of every `OutputFormat`/`ReindexTarget` variant and their documented defaults.
 - The external-tagging wire shapes (bare str for unit variants; single-key map for payload variants).
 - Non-UTF-8 path bytes (`0xff`) surviving in every path-bearing payload (the bin encoding).
+- The bin byte shape of the hash fields (`c4 20` + raw bytes) and their tolerance for the legacy int-array encoding (§2).
+- Cross-version decode: extra unknown field skipped, missing defaulted field filled, minimal old-client `HandshakeReq` accepted, unknown enum variant rejected (§1).
 - Decode totality: truncated and garbage bytes → `Err`, never panic.
 
-Not pinned: the byte-level shape of `Vec<u8>` hash fields, the phase-string vocabulary, and any cross-version decode (e.g. old bytes with a field missing, or extra unknown fields) — the defaults test covers same-version defaults only.
+Not pinned: the phase-string vocabulary.
 
 ## Divergences & open questions
 
 1. **Paths are `NdexPath`, not PRD's `Vec<u8>`.** PRD §12.4/§12.7 type all paths as `Vec<u8>`. Code uses `NdexPath`, whose custom impl produces MessagePack **bin**; a literal `Vec<u8>` under `rmp-serde` would produce an int array. Code wins; the PRD structs were never wire-exact.
-2. **Two different encodings for byte blobs.** Paths go as bin, but the hash fields (`FileInfo.blake3`, `CorruptedFile.stored_hash`/`actual_hash`) remain plain `Vec<u8>` and therefore encode as arrays of ints (~2–3× the bytes of bin for a 32-byte hash, and shape-inconsistent). No test pins the hash byte shape, so switching to `serde_bytes`/bin would be invisible to the current suite.
-3. **Wire `MediaMeta` includes `lens`.** Absent from PRD §12.7; the addition is a documented skeleton reconciliation on the type (owned by [11-data-model](../10-core/11-data-model.md)) but is wire-visible through `FileInfo.media_meta`.
-4. **Forward-compat is uneven across the wire surface.** Every `message.rs` struct has container-level `#[serde(default)]`, but the embedded core types do not: `SearchFilters` has it only on its `tags` field, and `DocMeta`/`MediaMeta` not at all. Serde errors on a *missing* field without a default — so adding a field to any of those three structs breaks decoding of older peers' messages, violating the additive-fields rule in [52-handshake](52-handshake.md) §4. Invisible today only because the codec always writes every field.
-5. **`file_id` signedness differs from the manifest.** Wire types use `file_id: u64`; the manifest row (`FileRecord`, [11-data-model](../10-core/11-data-model.md)) uses `i64` (SQLite rowid). The conversion point and overflow/negative policy are unspecified.
-6. **The server receives rendering concerns.** PRD §13.7 states "the remote knows nothing about terminal capabilities — it sends structured progress, the client decides how to display", yet the handshake ships `TerminalCaps` (PRD §12.3) and `SearchRequestData` ships `format: OutputFormat` (PRD §12.4) to the server. The code faithfully implements both PRD sections; the tension is inherited from the PRD, and nothing in v0.1 defines what the server should do with either field.
-7. **`HandshakeResp.index_last_reconciled_ns` has no "never" sentinel.** It is a bare `i64` (default `0`), while the equivalent `IndexSummary` field is `Option<i64>`. A fresh index presumably reports `0` — indistinguishable from a 1970 timestamp — but no code assigns it yet.
-8. **Phase strings are unconstrained.** `ProgressEvent.phase` is free-form; PRD §13.7's vocabulary is convention only, and the core `ProgressKind` → string mapping does not exist yet.
+2. **Wire `MediaMeta` includes `lens`.** Absent from PRD §12.7; the addition is a documented skeleton reconciliation on the type (owned by [11-data-model](../10-core/11-data-model.md)) but is wire-visible through `FileInfo.media_meta`.
+3. **`file_id` signedness differs from the manifest.** Wire types use `file_id: u64`; the manifest row (`FileRecord`, [11-data-model](../10-core/11-data-model.md)) uses `i64` (SQLite rowid). The conversion point and overflow/negative policy are unspecified.
+4. **The server receives rendering concerns.** PRD §13.7 states "the remote knows nothing about terminal capabilities — it sends structured progress, the client decides how to display", yet the handshake ships `TerminalCaps` (PRD §12.3) and `SearchRequestData` ships `format: OutputFormat` (PRD §12.4) to the server. The code faithfully implements both PRD sections; the tension is inherited from the PRD, and nothing in v0.1 defines what the server should do with either field.
+5. **`HandshakeResp.index_last_reconciled_ns` has no "never" sentinel.** It is a bare `i64` (default `0`), while the equivalent `IndexSummary` field is `Option<i64>`. A fresh index presumably reports `0` — indistinguishable from a 1970 timestamp — but no code assigns it yet.
+6. **Phase strings are unconstrained.** `ProgressEvent.phase` is free-form; PRD §13.7's vocabulary is convention only, and the core `ProgressKind` → string mapping does not exist yet.
+
+*Resolved 2026-07 (pre-transport wire hardening):*
+- *Byte-blob encoding split — the hash fields (`FileInfo.blake3`, `CorruptedFile.stored_hash`/`actual_hash`) now encode as **bin** via `serde_bytes`, matching `NdexPath` and cutting ~2–3× int-array bloat for 32-byte hashes; the byte shape is pinned and legacy int-array input still decodes (§2).*
+- *Uneven forward-compat — the core wire-embedded types (`SearchFilters`, `DocMeta`, `MediaMeta`, `ArchiveMeta`) now carry container-level `#[serde(default)]` like every `message.rs` struct, so adding a field to them no longer breaks older peers' decoding (§1).*

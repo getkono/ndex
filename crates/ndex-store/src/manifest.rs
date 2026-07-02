@@ -19,11 +19,15 @@ fn now_ns() -> i64 {
 }
 
 /// Connection pragmas applied at open (PRD §10.1).
+///
+/// `foreign_keys` is connection-local in SQLite (default off), so it must be enabled on
+/// every open for `REFERENCES` / `ON DELETE CASCADE` to be enforced.
 pub const MANIFEST_PRAGMAS: &str = "\
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA cache_size = -262144;
 PRAGMA mmap_size = 1073741824;
+PRAGMA foreign_keys = ON;
 ";
 
 /// Table and index DDL for the manifest (PRD §10.1).
@@ -106,6 +110,9 @@ pub enum RunKind {
 pub enum Change {
     New,
     Modified,
+    /// Metadata unchanged, but the stored status (`Pending`, or `FailedTransient` under the
+    /// retry limit) means the file still needs processing (PRD §11.5 retry policy).
+    Retry,
     Unchanged,
     Deleted,
 }
@@ -173,8 +180,10 @@ impl Manifest {
     }
 
     /// Insert/update a walked file's metadata, returning its `file_id` (two-phase commit
-    /// intent write, PRD §11.2). New entries are inserted `status = Pending`; a re-seen,
-    /// changed file is reset to `Pending` so it is reprocessed.
+    /// intent write, PRD §11.2). New entries are inserted `status = Pending`. On conflict
+    /// (a re-seen path), `status` is reset to `Pending` — and `fail_count`/`error_msg` are
+    /// cleared — **only when `(size, mtime_ns)` changed**; an unchanged re-seen file keeps
+    /// its status and retry accounting.
     pub fn upsert_walked(&self, path: &NdexPath, entry: &WalkEntry) -> Result<i64> {
         let now = now_ns();
         self.conn
@@ -185,9 +194,18 @@ impl Manifest {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9, ?9) \
                  ON CONFLICT(path) DO UPDATE SET \
                    path_hash = excluded.path_hash, inode = excluded.inode, dev = excluded.dev, \
+                   status = CASE WHEN files.size = excluded.size \
+                                  AND files.mtime_ns = excluded.mtime_ns \
+                            THEN files.status ELSE 0 END, \
+                   fail_count = CASE WHEN files.size = excluded.size \
+                                      AND files.mtime_ns = excluded.mtime_ns \
+                                THEN files.fail_count ELSE 0 END, \
+                   error_msg = CASE WHEN files.size = excluded.size \
+                                     AND files.mtime_ns = excluded.mtime_ns \
+                               THEN files.error_msg ELSE NULL END, \
                    size = excluded.size, mtime_ns = excluded.mtime_ns, \
                    ctime_ns = excluded.ctime_ns, mode = excluded.mode, \
-                   status = 0, last_verified_ns = excluded.last_verified_ns \
+                   last_verified_ns = excluded.last_verified_ns \
                  RETURNING file_id",
                 params![
                     path.as_bytes(),
@@ -221,13 +239,24 @@ impl Manifest {
     }
 
     /// Classify a walked path against the manifest (Phase 2 diff, PRD §11.1).
-    pub fn classify(&self, path: &NdexPath, entry: &WalkEntry) -> Result<Change> {
+    ///
+    /// `(size, mtime_ns)` changes classify as `Modified`. With unchanged metadata, rows
+    /// whose status is `Pending` — or `FailedTransient` with `fail_count < max_retries` —
+    /// classify as [`Change::Retry`] so interrupted or transiently failed files are
+    /// reprocessed (PRD §11.5). Everything else (`Indexed`, `Skipped`, `FailedPermanent`,
+    /// exhausted transients awaiting promotion) is `Unchanged`. Read-only: the
+    /// transient→permanent promotion write is [`Manifest::promote_exhausted_transients`].
+    pub fn classify(&self, path: &NdexPath, entry: &WalkEntry, max_retries: u32) -> Result<Change> {
         match self.get_by_path(path)? {
             None => Ok(Change::New),
-            Some(rec) if rec.size == entry.size && rec.mtime_ns == entry.mtime_ns => {
-                Ok(Change::Unchanged)
+            Some(rec) if rec.size != entry.size || rec.mtime_ns != entry.mtime_ns => {
+                Ok(Change::Modified)
             }
-            Some(_) => Ok(Change::Modified),
+            Some(rec) => match rec.status {
+                FileStatus::Pending => Ok(Change::Retry),
+                FileStatus::FailedTransient if rec.fail_count < max_retries => Ok(Change::Retry),
+                _ => Ok(Change::Unchanged),
+            },
         }
     }
 
@@ -244,6 +273,146 @@ impl Manifest {
                      last_verified_ns = ?4 \
                  WHERE file_id = ?5",
                 params![i64::from(status.as_u8()), error, bump, now_ns(), file_id],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Batch status flip after a durable FTS commit: mark `files` as `Indexed`, persist
+    /// their BLAKE3 content hashes, and upsert their `index_progress` rows — all in one
+    /// SQLite transaction (PRD §11.2 two-phase commit, step 2).
+    ///
+    /// Crash-safety invariant: `status = Indexed` implies the file's chunks are durably
+    /// committed in the FTS index — so the caller MUST call this only **after**
+    /// `FtsIndex::commit()` succeeds. Success clears the retry accounting
+    /// (`fail_count = 0`, `error_msg = NULL`).
+    pub fn mark_indexed(
+        &self,
+        files: &[(i64, [u8; 32])],
+        index_name: &str,
+        schema_ver: u32,
+    ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let now = now_ns();
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        {
+            let mut status = tx
+                .prepare(
+                    "UPDATE files \
+                     SET status = ?1, blake3 = ?2, fail_count = 0, error_msg = NULL, \
+                         last_verified_ns = ?3 \
+                     WHERE file_id = ?4",
+                )
+                .map_err(db_err)?;
+            let mut progress = tx
+                .prepare(
+                    "INSERT INTO index_progress (file_id, index_name, schema_ver, indexed_at_ns) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(file_id, index_name) DO UPDATE SET \
+                       schema_ver = excluded.schema_ver, indexed_at_ns = excluded.indexed_at_ns",
+                )
+                .map_err(db_err)?;
+            for (file_id, blake3) in files {
+                status
+                    .execute(params![
+                        i64::from(FileStatus::Indexed.as_u8()),
+                        blake3.as_slice(),
+                        now,
+                        file_id,
+                    ])
+                    .map_err(db_err)?;
+                progress
+                    .execute(params![file_id, index_name, i64::from(schema_ver), now])
+                    .map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Batch deletion flip after a durable FTS commit: mark `file_ids` as `Deleted` and
+    /// drop their `index_progress` rows, all in one SQLite transaction. Like
+    /// [`Manifest::mark_indexed`], this must run only **after** the FTS deletes committed.
+    pub fn mark_deleted(&self, file_ids: &[i64]) -> Result<()> {
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+        let now = now_ns();
+        let tx = self.conn.unchecked_transaction().map_err(db_err)?;
+        {
+            let mut status = tx
+                .prepare("UPDATE files SET status = ?1, last_verified_ns = ?2 WHERE file_id = ?3")
+                .map_err(db_err)?;
+            let mut progress = tx
+                .prepare("DELETE FROM index_progress WHERE file_id = ?1")
+                .map_err(db_err)?;
+            for file_id in file_ids {
+                status
+                    .execute(params![
+                        i64::from(FileStatus::Deleted.as_u8()),
+                        now,
+                        file_id
+                    ])
+                    .map_err(db_err)?;
+                progress.execute(params![file_id]).map_err(db_err)?;
+            }
+        }
+        tx.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Promote `FailedTransient` rows whose `fail_count` reached `max_retries` to
+    /// `FailedPermanent` (PRD §11.5 retry policy), returning the number promoted.
+    /// `error_msg` (the last failure) and `fail_count` are preserved for diagnostics.
+    pub fn promote_exhausted_transients(&self, max_retries: u32) -> Result<u64> {
+        let n = self
+            .conn
+            .execute(
+                "UPDATE files SET status = ?1, last_verified_ns = ?2 \
+                 WHERE status = ?3 AND fail_count >= ?4",
+                params![
+                    i64::from(FileStatus::FailedPermanent.as_u8()),
+                    now_ns(),
+                    i64::from(FileStatus::FailedTransient.as_u8()),
+                    i64::from(max_retries),
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(n as u64)
+    }
+
+    /// `file_id`s holding `index_progress` rows although their status is neither
+    /// `Indexed` nor `Skipped` — evidence of an interrupted run whose FTS state must be
+    /// purged to restore the crash-safety invariant (see `ndex-reconcile::recover`).
+    pub fn recovery_candidates(&self) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT ip.file_id FROM index_progress ip \
+                 JOIN files f ON f.file_id = ip.file_id \
+                 WHERE f.status NOT IN (?1, ?2)",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    i64::from(FileStatus::Indexed.as_u8()),
+                    i64::from(FileStatus::Skipped.as_u8()),
+                ],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+    }
+
+    /// Drop all `index_progress` rows for `file_id` (crash recovery / skip transitions).
+    pub fn clear_progress(&self, file_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM index_progress WHERE file_id = ?1",
+                params![file_id],
             )
             .map_err(db_err)?;
         Ok(())

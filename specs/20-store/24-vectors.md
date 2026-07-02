@@ -58,7 +58,7 @@ Per PRD §10.3: inner-product metric over L2-normalized vectors (= cosine), `f16
 
 ## Divergences & open questions
 
-1. **Unreachable engine:** `Store` never constructs a `VectorIndex` (always `None`), yet the ignored store roundtrip test expects `vectors.is_some()` after a default-model create — see [layout & locking](21-layout-and-locking.md) divergence 2. Until wired, semantic/hybrid search can only take the FTS fallback path.
+1. **Unreachable engine:** `Store` never constructs a `VectorIndex` (always `None`), yet the ignored store roundtrip test expects `vectors.is_some()` after a default-model create — see [layout & locking](21-layout-and-locking.md) divergence 2. Until wired, hybrid/auto search can only take the FTS fallback path, and explicit semantic returns zero hits with a warning (policy owned by [search](../40-search/41-search.md)).
 2. **24-byte record vs 20 bytes of fields:** `SidecarEntry`'s declared fields (u64 + i64 + u32) leave 4 bytes of the documented fixed 24-byte record unaccounted for. Padding? Reserved flags (e.g., a tombstone bit — see 3)? Must be fixed before `save`/`load` are written, since it defines the file format.
 3. **Tombstone lookup mechanism unspecified:** PRD §13.8 says "the sidecar lookup skips deleted file_ids", but `SidecarEntry` has no deleted flag and no deleted-set is defined. Options (flag byte in the reserved record space, in-memory set from the manifest's `status = 3` rows, usearch-level filtering) are all unchosen.
 4. **Header layout unspecified:** the 128-byte header's exact byte layout (version width, count width, model-name length/truncation, endianness) exists nowhere; `Sidecar::load`'s "validating the magic header" is the only committed check.

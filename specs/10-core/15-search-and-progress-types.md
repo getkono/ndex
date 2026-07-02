@@ -25,6 +25,7 @@ Search execution mode (PRD §10.7). Derived serde on a unit-variant enum: serial
 
 ```rust
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SearchFilters { ... }
 ```
 
@@ -38,10 +39,10 @@ Filters applied to a search (PRD §12.7); embedded in the wire `SearchRequestDat
 | `larger` | `Option<u64>` | minimum size in bytes |
 | `smaller` | `Option<u64>` | maximum size in bytes |
 | `path_glob` | `Option<String>` | path glob, e.g. `invoices/**/*.pdf` |
-| `tags` | `Vec<String>` `#[serde(default)]` | tag filter, OR semantics |
+| `tags` | `Vec<String>` | tag filter, OR semantics |
 | `lang` | `Option<String>` | language filter, ISO 639-1 |
 
-`#[serde(default)]` appears **only** on `tags`, so a payload omitting `tags` deserializes to an empty vec; the `Option` fields tolerate omission via serde's built-in Option handling. `Default` is all-`None`/empty (pinned along with round-trip by `search_filters_default_is_empty_and_roundtrips`). Filter matching semantics (glob dialects, inclusive/exclusive bounds) are not defined by this type — they are owned by [search](../40-search/41-search.md).
+The container-level `#[serde(default)]` means a payload may omit **any** field and it takes its default (`tags` → empty vec; the `Option` fields → `None`, which serde's built-in Option handling would also give). This satisfies the additive-evolution rule (PRD §12.3): fields added to `SearchFilters` later must be defaulted, and payloads from older peers that lack them still decode — pinned at the MessagePack level by `search_filters_msgpack_decodes_with_missing_fields`. `Default` is all-`None`/empty (pinned along with round-trip by `search_filters_default_is_empty_and_roundtrips`). Filter matching semantics (glob dialects, inclusive/exclusive bounds) are not defined by this type — they are owned by [search](../40-search/41-search.md).
 
 ## Progress reporting ✅
 

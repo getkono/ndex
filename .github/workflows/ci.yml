@@ -48,6 +48,9 @@ jobs:
       - name: Build
         run: mise run build
 
+      - name: Client/engine boundary
+        run: mise run boundary
+
       - name: Test
         run: mise run test
 

@@ -1,8 +1,10 @@
 //! Characterization tests for the public `ndex-extract` interface.
 //!
-//! Detection/classification helpers (MIME, BOM, NFC, language, archive-safety, JSON shape) are
-//! REAL and exercised live. Transcoding, routing-to-blocks, chunking, and the tree-sitter grammar
-//! map are `todo!()`; their contracts are pinned by `#[ignore = "impl pending: PR #3"]` tests.
+//! Everything exercised here is live: detection/classification helpers (MIME, BOM, NFC,
+//! language, archive-safety, JSON shape), UTF-8/UTF-16 transcoding, MIME routing (including
+//! the skip disposition), plaintext block extraction, chunking, and the tree-sitter grammar
+//! map. Format extractors that are still `todo!()` (PDF/DOCX/HTML/image/archive) are only
+//! constructed here, never invoked.
 
 use ndex_core::config::{Chunking, Config};
 use ndex_core::model::{Block, BlockType};
@@ -11,7 +13,7 @@ use ndex_core::tokens::TokenCounter;
 use ndex_extract::archive_safety::{
     MEMBER_DELIM, exceeds_ratio, is_unsafe_member_path, member_path, with_panic_isolation,
 };
-use ndex_extract::extractor::{ExtractCtx, Extractor, is_archive_mime, router};
+use ndex_extract::extractor::{ExtractCtx, Extractor, Route, is_archive_mime, router};
 use ndex_extract::formats::code::language_for;
 use ndex_extract::formats::text::{JsonVariant, PlaintextExtractor, json_variant};
 use ndex_extract::{Chunker, encoding, lang, mime};
@@ -20,7 +22,7 @@ fn p(s: &str) -> NdexPath {
     NdexPath::new(s.as_bytes().to_vec())
 }
 
-/// A whitespace token counter for `ExtractCtx`/`Chunker` construction in todo-contract tests.
+/// A whitespace token counter for `ExtractCtx`/`Chunker` construction.
 struct Whitespace;
 impl TokenCounter for Whitespace {
     fn count(&self, text: &str) -> usize {
@@ -145,7 +147,13 @@ fn unsafe_member_paths_rejected() {
     assert!(is_unsafe_member_path("../../etc/passwd"));
     assert!(is_unsafe_member_path("a\0b"));
     assert!(is_unsafe_member_path("dir\\..\\x"));
+    // Bare `..` components (no trailing separator) are traversal too.
+    assert!(is_unsafe_member_path(".."));
+    assert!(is_unsafe_member_path("foo/.."));
+    assert!(is_unsafe_member_path("foo/../bar"));
     assert!(!is_unsafe_member_path("2024/Q3-report.pdf"));
+    // `..` embedded in a file name is not a traversal component.
+    assert!(!is_unsafe_member_path("notes..txt"));
 }
 
 #[test]
@@ -183,7 +191,7 @@ fn archive_mimes_recognized() {
 }
 
 #[test]
-fn router_constructs_for_every_branch_without_panicking() {
+fn router_dispatches_supported_mimes_and_skips_the_rest() {
     for m in [
         "application/pdf",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -195,9 +203,15 @@ fn router_constructs_for_every_branch_without_panicking() {
         "application/zip",
         "image/png",
         "text/x-rust",
-        "application/octet-stream",
+        "text/plain",
     ] {
-        let _boxed = router(m); // construction is real even though extract() is todo
+        // Construction is real even where extract() is still todo!().
+        assert!(matches!(router(m), Route::Extract(_)), "{m}");
+    }
+    // Unidentifiable binary and MIMEs with no extractor are skipped (PRD §4.8: status=5),
+    // not lossily decoded as plaintext.
+    for m in ["application/octet-stream", "video/mp4", "font/woff2"] {
+        assert!(matches!(router(m), Route::Skip), "{m}");
     }
 }
 
@@ -210,7 +224,7 @@ fn json_variant_by_first_nonws_byte() {
 }
 
 // ---------------------------------------------------------------------------
-// todo!() contracts (PR #3 targets).
+// Transcoding, extraction-to-blocks, and chunking (PRD §4.5, §4.8).
 // ---------------------------------------------------------------------------
 
 #[test]

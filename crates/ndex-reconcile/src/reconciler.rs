@@ -26,6 +26,11 @@ fn phase(sink: &dyn ProgressSink, kind: ProgressKind, message: &str) {
 
 /// Options for a reconciliation run. The server maps the wire `IndexOptions` to this (keeping
 /// `ndex-reconcile` independent of `ndex-protocol`).
+///
+/// Honored in v0.1: `full` (run-kind label), `dry_run`, `max_file_size` (overrides config
+/// `extraction.max_file_size`), `only_new` (process new files only; no modified/deleted
+/// handling). `verify`, `jobs`, `batch_size`, and `no_vectors` are accepted but ignored —
+/// setting them emits a `tracing::warn` once per run.
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileOptions {
     pub full: bool,
@@ -52,6 +57,31 @@ pub struct ReconcileStats {
     pub timed_out: bool,
 }
 
+/// Warn once per run about options that are accepted but not yet implemented (honesty
+/// over silence — callers must not believe `verify`/`jobs`/`batch_size`/`no_vectors` do
+/// anything in v0.1).
+fn warn_ignored_options(options: &ReconcileOptions) {
+    let mut ignored = Vec::new();
+    if options.verify {
+        ignored.push("verify");
+    }
+    if options.jobs.is_some() {
+        ignored.push("jobs");
+    }
+    if options.batch_size.is_some() {
+        ignored.push("batch_size");
+    }
+    if options.no_vectors {
+        ignored.push("no_vectors");
+    }
+    if !ignored.is_empty() {
+        tracing::warn!(
+            options = ?ignored,
+            "reconcile options accepted but ignored in v0.1"
+        );
+    }
+}
+
 /// Drives the three-phase reconciliation (walk → diff → process), records the run in
 /// `reconciliation_runs`, and prunes history (PRD §11).
 pub struct Reconciler<'a> {
@@ -66,28 +96,50 @@ impl<'a> Reconciler<'a> {
     }
 
     /// Run a reconciliation, emitting progress through `sink` (PRD §11).
+    ///
+    /// Non-dry runs start with crash recovery ([`crate::recover::recover`]) and the
+    /// transient→permanent promotion sweep (PRD §11.5). Dry runs are pure: walk + diff
+    /// only, with **no** writes of any kind (no run row, no recovery, no promotion).
     pub fn run(
         &mut self,
         options: &ReconcileOptions,
         sink: &dyn ProgressSink,
     ) -> Result<ReconcileStats> {
         let start = now_ns();
+        warn_ignored_options(options);
         let root = self.store.root().to_path_buf();
         let kind = if options.full {
             RunKind::Full
         } else {
             RunKind::Incremental
         };
-        let run_id = self.store.manifest.begin_run(kind, "mtime")?;
+        let max_retries = self.store.config.extraction.max_retries;
+
+        let run_id = if options.dry_run {
+            None
+        } else {
+            crate::recover::recover(self.store)?;
+            let promoted = self
+                .store
+                .manifest
+                .promote_exhausted_transients(max_retries)?;
+            if promoted > 0 {
+                tracing::info!(
+                    promoted,
+                    "promoted exhausted transient failures to permanent"
+                );
+            }
+            Some(self.store.manifest.begin_run(kind, "mtime")?)
+        };
 
         // Phase 1: walk.
         phase(sink, ProgressKind::Walk, "scanning files");
         let walk = crate::walk::walk(&root, &self.store.config)?;
         crate::walk::preflight_memory(walk.files.len() as u64)?;
 
-        // Phase 2: diff.
+        // Phase 2: diff (read-only).
         phase(sink, ProgressKind::Diff, "computing changes");
-        let diff = crate::diff::diff(&self.store.manifest, &walk)?;
+        let diff = crate::diff::diff(&self.store.manifest, &walk, max_retries)?;
 
         // Phase 3: process (skipped on a dry run).
         let mut stats = if options.dry_run {
@@ -99,7 +151,8 @@ impl<'a> Reconciler<'a> {
                 ..ReconcileStats::default()
             }
         } else {
-            let stats = crate::process::process(self.store, self.embedder, &diff, sink)?;
+            let stats = crate::process::process(self.store, self.embedder, &diff, options, sink)?;
+            let run_id = run_id.expect("non-dry run has a run row");
             self.store.manifest.finish_run(run_id)?;
             self.store.manifest.touch_last_reconciliation(now_ns())?;
             self.store.manifest.prune_reconciliation_runs(RUN_HISTORY)?;

@@ -40,14 +40,14 @@ Static description of an available model:
 |---|---|
 | `shortname: &'static str` | CLI shortname (e.g. `arctic`) |
 | `full_name: &'static str` | full model name; also the on-disk directory name |
-| `onnx_blake3: &'static str` | expected BLAKE3 of `model.onnx` (hex), pinned at release time |
-| `tokenizer_blake3: &'static str` | expected BLAKE3 of `tokenizer.json` (hex) |
+| `onnx_blake3: Option<&'static str>` | expected BLAKE3 of `model.onnx` (hex). **`None` = not yet pinned** — set when a real model artifact hash is known (release time, [73-release.md](../70-operations/73-release.md)) |
+| `tokenizer_blake3: Option<&'static str>` | expected BLAKE3 of `tokenizer.json` (hex); same `None` = unpinned semantics |
 | `dimensions: u32` | native embedding dimensionality |
 | `mrl_dimensions: u32` | MRL-truncated, stored/searched dimensionality |
 | `languages: u32` | supported language count |
 | `url: &'static str` | release download URL |
 
-### 2.2 The v0.1 registry — 🚧 partial (entry real, hashes/URL placeholders)
+### 2.2 The v0.1 registry — 🚧 partial (entry real, hashes unpinned, URL placeholder)
 
 `REGISTRY` ships exactly **one** model in v0.1:
 
@@ -60,7 +60,7 @@ Static description of an available model:
 | Stored vector scalar | f16 (L2-normalized; the vector index itself is owned by [24-vectors.md](../20-store/24-vectors.md)) |
 | Model file precision | INT8-quantized ONNX, ~297 MB (PRD §7.4; not yet encoded anywhere in code) |
 | Languages | 74 |
-| `onnx_blake3` / `tokenizer_blake3` | literal `"TODO"` — to be pinned at packaging time (see [73-release.md](../70-operations/73-release.md)) |
+| `onnx_blake3` / `tokenizer_blake3` | `None` — not yet pinned; real hashes land at packaging time (see [73-release.md](../70-operations/73-release.md)) |
 | `url` | `https://github.com/justy/ndex/releases/download/models/snowflake-arctic-embed-m-v2.0.tar.gz` — placeholder org (see Divergences) |
 
 Lookups: `lookup(name)` matches **shortname or full name** (exact, case-sensitive); `list()` returns the whole registry. ✅ implemented.
@@ -96,7 +96,7 @@ All four bodies are `todo!()`; intended behavior from doc comments + PRD:
 
 ### 3.3 Consumers — 📋 planned
 
-Auto-fetch-on-first-use during `ndex-remote index`, the `ndex-remote serve` refusal-to-start when the model is missing, and the `ndex-remote model {list,fetch,verify,delete,path,import}` CLI family (PRD §7.4) are the server's responsibility and are specified in [63-remote.md](../60-interfaces/63-remote.md); its `model` command dispatcher is itself a stub that plans to call the functions above. The only registry consumer wired today is `ndex-remote init`, which copies `ModelInfo` fields into the immutable index identity ([22-manifest.md](../20-store/22-manifest.md) / [11-data-model.md](../10-core/11-data-model.md)).
+Auto-fetch-on-first-use during `ndex-remote index`, the `ndex-remote serve` refusal-to-start when the model is missing, and the `ndex-remote model {list,fetch,verify,delete,path,import}` CLI family (PRD §7.4) are the server's responsibility and are specified in [63-remote.md](../60-interfaces/63-remote.md); its `model` command dispatcher is itself a stub that plans to call the functions above. The only registry consumer wired today is `ndex-remote init`, which copies `ModelInfo` fields into the immutable index identity ([22-manifest.md](../20-store/22-manifest.md) / [11-data-model.md](../10-core/11-data-model.md)); an unpinned `onnx_blake3` (`None`) is written as the **empty string** `model_hash` — empty = unpinned ([63-remote.md §5.1](../60-interfaces/63-remote.md)).
 
 ## 4. Tokenizer (`tokenizer.rs`)
 
@@ -162,7 +162,7 @@ At index time, chunks are batched for inference; batch size is `embedding.batch_
 
 | Item | Status |
 |---|---|
-| `ModelInfo`, `REGISTRY`, `lookup`, `list` | ✅ (🚧 hashes/URL are placeholders) |
+| `ModelInfo`, `REGISTRY`, `lookup`, `list` | ✅ (🚧 hashes unpinned, URL is a placeholder) |
 | `models_dir`, `model_path` | ✅ |
 | `fetch`, `verify`, `import`, `delete` | ⛔ `todo!()` |
 | `manifest.json` in model dir | 📋 no code |
@@ -176,7 +176,7 @@ At index time, chunks are batched for inference; batch size is `embedding.batch_
 
 ## Divergences & open questions
 
-1. **Placeholder release coordinates.** `REGISTRY` ships `onnx_blake3 = "TODO"`, `tokenizer_blake3 = "TODO"`, and a download URL under `github.com/justy/ndex` while the repository lives under `getkono`. PRD §7.4 requires artifacts published from the ndex GitHub releases with pinned hashes. Note `ndex-remote init` already copies `onnx_blake3` (`"TODO"`) into the immutable index identity as `model_hash` — indexes created before hash pinning will carry the placeholder forever.
+1. **Unpinned release coordinates.** `REGISTRY` ships `onnx_blake3 = None`, `tokenizer_blake3 = None`, and a download URL under `github.com/justy/ndex` while the repository lives under `getkono`. PRD §7.4 requires artifacts published from the ndex GitHub releases with pinned hashes. *(Resolved: the earlier `"TODO"` placeholder no longer poisons the immutable identity — unpinned hashes are `None` in the registry and an empty-string `model_hash` in `index.toml`, §2.2/§3.3; indexes created before pinning record "unpinned", not a bogus hash.)*
 2. **`ort` linkage contradicts PRD §4.7.** PRD recommends `download-binaries` for dev and static linking for distribution ("eliminates `libonnxruntime.so` runtime dependencies"). The workspace exact-pins `ort` with `load-dynamic` ([71-toolchain.md](../70-operations/71-toolchain.md) §8.3), which *requires* a runtime `libonnxruntime.so` — the opposite of the distribution goal. The workspace's default-features note (recorded in [71-toolchain.md](../70-operations/71-toolchain.md)) suggests the choice is a workaround for the pinned release candidate, but no doc records the intended distribution story.
 3. **Query truncation warning is unowned.** PRD §4.7: queries over 512 tokens "are truncated with a warning." `MAX_QUERY_TOKENS` exists and `Tokenizer::truncate` exists, but nothing connects them, and no warning channel is designed (`embed_batch` returns only vectors).
 4. **`manifest.json` has no code counterpart.** PRD §7.4's model directory includes `manifest.json` ("model metadata, expected hashes"); the code keeps hashes solely in the static registry and never reads/writes a manifest. One of the two should be declared authoritative.

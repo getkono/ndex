@@ -37,6 +37,9 @@ impl FromStr for ByteSize {
             .trim()
             .parse()
             .map_err(|_| format!("invalid number in byte size: {s:?}"))?;
+        if num < 0.0 {
+            return Err("negative byte size".to_string());
+        }
         let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
             "" | "b" => 1,
             "k" | "kb" => 1_000,
@@ -49,7 +52,16 @@ impl FromStr for ByteSize {
             "tib" => 1 << 40,
             other => return Err(format!("unknown byte unit: {other:?}")),
         };
-        Ok(ByteSize((num * mult as f64) as u64))
+        let bytes = num * mult as f64;
+        // `u64::MAX as f64` rounds up to 2^64, so `>=` rejects exactly the values a `u64`
+        // cannot hold (NaN also fails the finite check).
+        if !bytes.is_finite() || bytes >= u64::MAX as f64 {
+            return Err(format!(
+                "byte size out of range (max {} bytes): {s:?}",
+                u64::MAX
+            ));
+        }
+        Ok(ByteSize(bytes as u64))
     }
 }
 
@@ -117,14 +129,17 @@ impl FromStr for DurationSetting {
             .trim()
             .parse()
             .map_err(|_| format!("invalid number in duration: {s:?}"))?;
-        let secs = match unit.trim().to_ascii_lowercase().as_str() {
-            "" | "s" | "sec" | "secs" => num,
-            "m" | "min" | "mins" => num * 60,
-            "h" | "hr" | "hrs" => num * 3_600,
-            "d" | "day" | "days" => num * 86_400,
-            "w" | "wk" | "wks" => num * 604_800,
+        let unit_secs: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+            "" | "s" | "sec" | "secs" => 1,
+            "m" | "min" | "mins" => 60,
+            "h" | "hr" | "hrs" => 3_600,
+            "d" | "day" | "days" => 86_400,
+            "w" | "wk" | "wks" => 604_800,
             other => return Err(format!("unknown duration unit: {other:?}")),
         };
+        let secs = num
+            .checked_mul(unit_secs)
+            .ok_or_else(|| format!("duration out of range (overflows u64 seconds): {s:?}"))?;
         Ok(Self::from_secs(secs))
     }
 }

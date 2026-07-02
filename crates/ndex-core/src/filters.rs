@@ -20,6 +20,7 @@ pub enum SearchMode {
 /// Lives in `ndex-core` so that both `ndex-protocol` (the wire `SearchRequestData`)
 /// and `ndex-search` can use it — `ndex-search` does not depend on `ndex-protocol`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SearchFilters {
     /// MIME glob, e.g. `image/*`.
     pub mime: Option<String>,
@@ -34,7 +35,6 @@ pub struct SearchFilters {
     /// Path glob, e.g. `invoices/**/*.pdf`.
     pub path_glob: Option<String>,
     /// Tag filter with OR semantics.
-    #[serde(default)]
     pub tags: Vec<String>,
     /// Language filter (ISO 639-1).
     pub lang: Option<String>,

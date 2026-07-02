@@ -1,8 +1,9 @@
 //! End-to-end pipeline tests against the `ndex-remote` standalone CLI (PRD §18).
 //!
 //! `init_index_search_roundtrip` runs the real local pipeline. The remaining cases (all v0.1
-//! formats, crash recovery, sidecar repair, SSH transport) are `#[ignore]`d pending the vector
-//! index, the serve loop, and the thin-client transport.
+//! formats, sidecar repair, SSH transport) are `#[ignore]`d pending the vector index, the
+//! serve loop, and the thin-client transport. SIGKILL crash recovery is covered by the live
+//! harness in `tests/crash.rs`.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -87,12 +88,6 @@ fn init_index_search_roundtrip() {
 #[test]
 #[ignore = "impl pending: all v0.1 formats (pdf/docx/html/image/archive) + doc_meta/media_meta"]
 fn all_v0_1_formats_index_correctly() {
-    todo!()
-}
-
-#[test]
-#[ignore = "impl pending: SIGKILL mid-index → restart → recover from status=Pending (PRD §18.1)"]
-fn crash_recovery_resumes_pending_files() {
     todo!()
 }
 

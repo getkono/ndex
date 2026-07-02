@@ -10,9 +10,12 @@ use ndex_core::constants::LOCK_FILE;
 use ndex_core::error::{NdexError, Result};
 use rustix::fs::{FlockOperation, flock};
 
-/// A held exclusive advisory lock on `.ndex/lock`. Dropping the `File` releases it.
+/// A held advisory lock on `.ndex/lock`. Dropping the `File` releases it.
 ///
-/// A single `IndexLock` guards writes to *both* SQLite databases (PRD §11.3).
+/// Writers hold it **exclusive** (`acquire`/`try_acquire`): a single exclusive `IndexLock`
+/// guards writes to *both* SQLite databases (PRD §11.3). Readers hold it **shared**
+/// (`acquire_shared`/`try_acquire_shared`): any number of shared holders coexist, but shared
+/// and exclusive holders mutually exclude each other.
 pub struct IndexLock {
     _file: File,
 }
@@ -34,6 +37,30 @@ impl IndexLock {
             Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
             Err(e) => Err(NdexError::Lock(format!(
                 "failed to try-acquire write lock: {e}"
+            ))),
+        }
+    }
+
+    /// Acquire the shared read lock, blocking while a writer holds the exclusive lock.
+    ///
+    /// Concurrent readers are safe by engine design: SQLite WAL supports many readers
+    /// alongside a writer, and tantivy searches run on point-in-time snapshot readers.
+    pub fn acquire_shared(ndex_dir: &Path) -> Result<Self> {
+        let file = open_lock_file(ndex_dir)?;
+        flock(&file, FlockOperation::LockShared)
+            .map_err(|e| NdexError::Lock(format!("failed to acquire read lock: {e}")))?;
+        Ok(Self { _file: file })
+    }
+
+    /// Try to acquire the shared read lock without blocking; `Ok(None)` if a writer holds
+    /// the exclusive lock.
+    pub fn try_acquire_shared(ndex_dir: &Path) -> Result<Option<Self>> {
+        let file = open_lock_file(ndex_dir)?;
+        match flock(&file, FlockOperation::NonBlockingLockShared) {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
+            Err(e) => Err(NdexError::Lock(format!(
+                "failed to try-acquire read lock: {e}"
             ))),
         }
     }

@@ -69,7 +69,7 @@ With `target = 5`, `overlap = 2`, a whitespace token counter, and one paragraph 
 | 2 | `w6..w10` | same |
 | 3 | `w9..w11` | final short window (3 tokens; no `min_tokens` merge) |
 
-## 3. Locked-in behavior (characterization)
+## 3. Locked-in behavior (characterization + guardrail tests)
 
 `chunker_produces_ordered_chunks_for_the_file` (`crates/ndex-extract/tests/characterization.rs`) pins, for a 1000-word block under the default config with a whitespace counter:
 
@@ -77,7 +77,22 @@ With `target = 5`, `overlap = 2`, a whitespace token counter, and one paragraph 
 - every chunk carries the `file_id` passed to `chunk()`;
 - `chunk_ord` equals the chunk's index — monotonically increasing from 0 with no gaps.
 
-The in-module unit test `chunk_boundary_conditions` (`crates/ndex-extract/src/chunk.rs`) is `#[ignore]`d with a `todo!()` body — the named boundary cases (empty input, single token, exactly-`target`, `target + 1`, all-heading blocks) are ⛔ untested.
+The in-module unit test `chunk_boundary_conditions` (`crates/ndex-extract/src/chunk.rs`) pins the boundary cases with a one-token-per-word counter, `target = 4`, `overlap = 1`:
+
+- **empty input** — no blocks, an empty block, and a whitespace-only block all yield zero chunks;
+- **single token** — one chunk, `chunk_ord = 0`, text and byte range spanning exactly the word;
+- **exactly `target`** — a single chunk, no spill;
+- **`target + 1`** — two chunks; the second window's start steps back by `overlap`, re-including the previous window's last word (`w0 w1 w2 w3` / `w3 w4`);
+- **all-heading input** — `Heading` blocks chunk like any other block: `block_type` preserved on the chunk, `heading_path` never consulted, `chunk_ord` continuing across blocks, byte offsets honoring each block's `byte_start`.
+
+Property tests in the same module (`proptest`; dev-dep of the crate) pin four invariants over arbitrary text (including Unicode and whitespace-only), `target_tokens ∈ 0..64` (exercising the `0 → 1` clamp), `overlap_tokens ∈ 0..64` (exercising the `≥ target` clamp), for both a word counter and a byte-length counter (`chunk_invariants_single_block`), and across multiple blocks laid out back-to-back (`chunk_invariants_across_blocks`):
+
+1. `chunk_ord` equals the chunk's index — strictly monotonic from 0, no gaps, across all blocks;
+2. every chunk's byte range is non-empty, lies within the source text, falls on `char` boundaries, and slices back to exactly `chunk.text`;
+3. `byte_start` and `byte_end` are non-decreasing across consecutive chunks (including across blocks);
+4. realized overlap never exceeds the effective `overlap_tokens` plus one word: the shared tokens between consecutive windows, excluding the first shared word, are strictly less than the effective overlap (§2.4's back-walk stops at the first word crossing the budget).
+
+No genuine chunker defect has been found by these properties (run at 4096 cases).
 
 ## 4. Status summary
 
@@ -97,5 +112,5 @@ The in-module unit test `chunk_boundary_conditions` (`crates/ndex-extract/src/ch
 2. **PRD §4.5 chunking algorithm largely unimplemented:** no cross-block merging, no sentence-boundary splitting, no heading prefixing, no `min_tokens`, no hard max. Only PRD step 1 (extractor blocks), step 4 (chunk tuple fields), and an approximation of step 3 (overlap) exist.
 3. **Chunks can exceed `target_tokens` without bound** — a single unbroken token run (base64 blob, minified JS "word") becomes one chunk of arbitrary size, and can also exceed the embedding model's context limit; nothing downstream is specified to truncate.
 4. **Token accounting is per-word, not per-chunk.** Sizes drift from true model-token counts on subword tokenizers, and whitespace between words is uncounted; the realized chunk size in real tokens is unverified by any test.
-5. **Overlap is approximate and asymmetric** (stops at the first word making `back >= overlap`, never reaches the prior window's first word). No test pins realized overlap; the only chunking test checks ordering/`file_id`, and the boundary-condition unit test is an ignored `todo!()`.
-6. **Byte-offset coordinate space is inherited, not defined.** Chunk offsets are block-relative sums; for text-family extraction they index the normalized string, not the raw file (see [32-extraction.md](32-extraction.md) Divergence 9). Whether FTS/snippet consumers expect raw-file offsets is unresolved.
+5. **Overlap is approximate and asymmetric** (stops at the first word making `back >= overlap`, never reaches the prior window's first word). The §3 property test bounds realized overlap from above (≤ effective `overlap_tokens` + one word) but the exact realized value against a real subword tokenizer remains unverified.
+6. **Byte-offset coordinate space is inherited, not defined.** Chunk offsets are block-relative sums; for text-family extraction they index the normalized string, not the raw file (see [32-extraction.md](32-extraction.md) Divergence 7). Whether FTS/snippet consumers expect raw-file offsets is unresolved.

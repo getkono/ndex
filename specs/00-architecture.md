@@ -91,14 +91,14 @@ dependencies are limited to CLI/terminal/serialization/tracing crates. The invar
 is stated in a comment in `crates/ndex/Cargo.toml` ("this crate depends ONLY on
 ndex-core and ndex-protocol") and in `crates/ndex/src/lib.rs`.
 
-**How it is enforced:** structurally, by Cargo — an undeclared crate is unresolvable,
-so client code *cannot* `use` an engine crate without first editing
-`crates/ndex/Cargo.toml`. There is **no automated regression gate**: no cargo-deny
-ban rule ([71-toolchain](70-operations/71-toolchain.md)), no CI assertion
-([72-ci](70-operations/72-ci.md)), and no test checks the dependency set. A PR that
-adds `ndex-store` to the client's dependencies would pass CI; the boundary is held by
-the Cargo declaration plus review. (README's phrasing that the graph "*enforces*" the
-boundary is accurate only in this structural sense — see Divergences.)
+**How it is enforced:** two layers. Structurally, by Cargo — an undeclared crate is
+unresolvable, so client code *cannot* `use` an engine crate without first editing
+`crates/ndex/Cargo.toml`. And by an automated regression gate: the `boundary` mise
+task ([71-toolchain](70-operations/71-toolchain.md)) fails if
+`cargo tree -p ndex -e normal` contains any engine crate
+(`ndex-{store,extract,embed,search,reconcile,remote}`); it runs in CI
+([72-ci](70-operations/72-ci.md)) and as part of `mise run ci`. A PR that adds
+`ndex-store` to the client's dependencies now fails CI.
 
 Consequence of the boundary: the client's transitive closure excludes tantivy,
 usearch, rusqlite, ort, and all extractor libraries, which is what makes the
@@ -177,11 +177,10 @@ extractors, and the client/transport/serve path are the next increments
 
 ## Divergences & open questions
 
-- **"The dependency graph *enforces* the boundary" (README.md) overstates.** The
-  boundary is structural-plus-review only; nothing (deny.toml bans, CI, tests) would
-  catch a dependency edge being added to `crates/ndex/Cargo.toml`. An automated guard
-  (e.g. a cargo-deny `[bans]` entry or a CI `cargo tree -p ndex` assertion) does not
-  exist.
+- **README's "the dependency graph *enforces* the boundary" is now true in the CI
+  sense as well:** the `boundary` task (a `cargo tree -p ndex` assertion) gates CI.
+  A cargo-deny `[bans]` entry remains an alternative belt-and-suspenders option
+  ([71-toolchain](70-operations/71-toolchain.md)).
 - **Binary-size claims are unverified.** The client/server size targets
   ([73-release](70-operations/73-release.md)) appear in
   PRD §3, README.md, and RELEASING.md but are measured nowhere. Moreover today's

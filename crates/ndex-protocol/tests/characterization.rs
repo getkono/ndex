@@ -6,7 +6,10 @@
 //!
 //! Round-trips go through the crate's own MessagePack codec (`to_vec_named` / `from_slice`) —
 //! that is the real wire format, so these tests double as the format-stability proof mandated by
-//! PRD §12.4. Framing and preamble tests use `std::io::Cursor<Vec<u8>>` as an in-memory transport.
+//! PRD §12.4. Beyond round-trips, the suite pins wire byte shapes (external tagging, bin-encoded
+//! hash fields) and the cross-version decode contract (unknown fields skipped, missing defaulted
+//! fields filled, unknown variants rejected — PRD §12.3). Framing and preamble tests use
+//! `std::io::Cursor<Vec<u8>>` as an in-memory transport.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -385,6 +388,171 @@ fn tuple_variant_encodes_as_single_key_map_keyed_by_variant_name() {
 }
 
 // ---------------------------------------------------------------------------
+// Hash byte fields — MessagePack bin via serde_bytes, like NdexPath (PRD §12.7).
+// ---------------------------------------------------------------------------
+
+/// Locate `needle` in `haystack`, returning the offset just past it.
+fn find_past(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + needle.len())
+        .unwrap_or_else(|| panic!("byte pattern {needle:02x?} not found"))
+}
+
+#[test]
+fn hash_fields_encode_as_msgpack_bin() {
+    // A 32-byte hash must follow its field key as bin8 (0xc4, len 0x20, raw bytes) —
+    // not an int array. Field keys are fixstr: 0xa0 | len.
+    let bytes = to_vec_named(&CorruptedFile {
+        file_id: 9,
+        path: sample_path(),
+        stored_hash: vec![0x11; 32],
+        actual_hash: vec![0x22; 32],
+    })
+    .unwrap();
+    let at = find_past(&bytes, b"\xabstored_hash");
+    assert_eq!(&bytes[at..at + 2], [0xc4, 0x20], "bin8 header, 32 bytes");
+    assert_eq!(&bytes[at + 2..at + 34], [0x11u8; 32].as_slice());
+    let at = find_past(&bytes, b"\xabactual_hash");
+    assert_eq!(&bytes[at..at + 2], [0xc4, 0x20]);
+    assert_eq!(&bytes[at + 2..at + 34], [0x22u8; 32].as_slice());
+
+    // Same for the optional FileInfo.blake3: Some(hash) is bin directly, no wrapping.
+    let bytes = to_vec_named(&FileInfo {
+        blake3: Some(vec![0xaa; 32]),
+        ..Default::default()
+    })
+    .unwrap();
+    let at = find_past(&bytes, b"\xa6blake3");
+    assert_eq!(&bytes[at..at + 2], [0xc4, 0x20]);
+    assert_eq!(&bytes[at + 2..at + 34], [0xaau8; 32].as_slice());
+}
+
+#[test]
+fn hash_fields_decode_from_legacy_int_array() {
+    // Pre-serde_bytes peers encoded hashes as int arrays; the serde_bytes decoder
+    // also accepts sequences, so those frames still decode.
+    #[derive(Serialize)]
+    struct LegacyCorruptedFile {
+        file_id: u64,
+        path: NdexPath,
+        stored_hash: Vec<u8>, // no serde_bytes → int array on the wire
+        actual_hash: Vec<u8>,
+    }
+    let bytes = to_vec_named(&LegacyCorruptedFile {
+        file_id: 9,
+        path: sample_path(),
+        stored_hash: vec![1u8; 32],
+        actual_hash: vec![2u8; 32],
+    })
+    .unwrap();
+    let back: CorruptedFile = from_slice(&bytes).expect("legacy int-array hash decodes");
+    assert_eq!(back.stored_hash, vec![1u8; 32]);
+    assert_eq!(back.actual_hash, vec![2u8; 32]);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-version decoding — the additive-evolution contract (PRD §12.3).
+// The named (struct-map) codec makes unknown fields skippable and lets
+// container-level `#[serde(default)]` fill in absent fields. Tested on
+// protocol-owned structs; the core wire-embedded types (SearchFilters,
+// DocMeta, MediaMeta) gain container-level `serde(default)` separately.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decode_ignores_unknown_extra_field() {
+    // A "future" peer adds a field this version doesn't know about.
+    #[derive(Serialize)]
+    struct ErrorDataV2 {
+        code: u32,
+        message: String,
+        hint: String, // unknown to today's ErrorData
+    }
+    #[derive(Serialize)]
+    enum ServerMessageV2 {
+        Error(ErrorDataV2),
+    }
+    let bytes = to_vec_named(&ServerMessageV2::Error(ErrorDataV2 {
+        code: 7,
+        message: "no results".into(),
+        hint: "try --mode fts".into(),
+    }))
+    .unwrap();
+    let back: ServerMessage = from_slice(&bytes).expect("unknown field must be skipped");
+    assert_eq!(
+        back,
+        ServerMessage::Error(ErrorData {
+            code: 7,
+            message: "no results".into(),
+        })
+    );
+}
+
+#[test]
+fn decode_fills_missing_defaulted_field() {
+    // An "older" peer omits a field; container-level serde(default) fills it in.
+    #[derive(Serialize)]
+    struct ErrorDataV0 {
+        code: u32, // no `message`
+    }
+    #[derive(Serialize)]
+    enum ServerMessageV0 {
+        Error(ErrorDataV0),
+    }
+    let bytes = to_vec_named(&ServerMessageV0::Error(ErrorDataV0 { code: 4 })).unwrap();
+    let back: ServerMessage = from_slice(&bytes).unwrap();
+    assert_eq!(
+        back,
+        ServerMessage::Error(ErrorData {
+            code: 4,
+            message: String::new(),
+        })
+    );
+}
+
+#[test]
+fn handshake_req_decodes_when_new_fields_are_absent() {
+    // The critical cross-version surface: a minimal handshake from an older client.
+    #[derive(Serialize)]
+    struct HandshakeReqV0 {
+        min_protocol: u32,
+        max_protocol: u32,
+    }
+    let bytes = to_vec_named(&HandshakeReqV0 {
+        min_protocol: 1,
+        max_protocol: 1,
+    })
+    .unwrap();
+    let back: HandshakeReq = from_slice(&bytes).unwrap();
+    assert_eq!(back.min_protocol, 1);
+    assert_eq!(back.max_protocol, 1);
+    assert_eq!(back.client_version, "");
+    assert!(back.capabilities.is_empty());
+    assert_eq!(back.terminal, TerminalCaps::default());
+}
+
+#[test]
+fn unknown_enum_variant_is_a_decode_error() {
+    // Pinned CURRENT behavior: externally-tagged enums reject unknown variants —
+    // new message variants are NOT additive; they need a version/capability gate.
+    // Unknown unit variant (bare str on the wire).
+    let bytes = to_vec_named(&"FutureRequest").unwrap();
+    assert!(from_slice::<ClientMessage>(&bytes).is_err());
+    assert!(from_slice::<ServerMessage>(&bytes).is_err());
+
+    // Unknown payload-carrying variant (single-key map on the wire).
+    let mut map = BTreeMap::new();
+    map.insert("FutureRequest".to_string(), 1u32);
+    let bytes = to_vec_named(&map).unwrap();
+    assert!(from_slice::<ClientMessage>(&bytes).is_err());
+
+    // Unit-only utility enums behave the same.
+    let bytes = to_vec_named(&"Yaml").unwrap();
+    assert!(from_slice::<OutputFormat>(&bytes).is_err());
+}
+
+// ---------------------------------------------------------------------------
 // Framing — length-prefixed frames over an in-memory transport (PRD §12.2).
 // ---------------------------------------------------------------------------
 
@@ -461,6 +629,21 @@ fn write_frame_rejects_oversize_payload() {
     let mut buf = Vec::new();
     let mut w = FrameWriter::new(&mut buf);
     assert!(w.write_frame(&payload).is_err());
+}
+
+#[test]
+fn frame_at_exactly_max_frame_bytes_roundtrips() {
+    // The cap is inclusive: a payload of exactly MAX_FRAME_BYTES passes both the
+    // writer's and the reader's guard (cap+1 rejection is pinned above).
+    let payload = vec![0xa5u8; MAX_FRAME_BYTES];
+    let mut buf = Vec::with_capacity(MAX_FRAME_BYTES + 4);
+    FrameWriter::new(&mut buf).write_frame(&payload).unwrap();
+    assert_eq!(&buf[..4], (MAX_FRAME_BYTES as u32).to_be_bytes());
+
+    let mut r = FrameReader::new(Cursor::new(buf));
+    let got = r.read_frame().unwrap();
+    assert_eq!(got.len(), MAX_FRAME_BYTES);
+    assert_eq!(got, payload);
 }
 
 #[test]
@@ -544,6 +727,21 @@ fn scan_preamble_errs_when_absent_within_budget() {
     let garbage = vec![b'x'; MAX_PREAMBLE_SCAN_BYTES + 100];
     let mut r = FrameReader::new(Cursor::new(garbage));
     assert!(r.scan_preamble().is_err());
+}
+
+#[test]
+fn scan_preamble_garbage_budget_is_exactly_max_scan_bytes() {
+    // Scan a stream of `garbage_len` junk bytes followed by the preamble.
+    fn scan_after(garbage_len: usize) -> ndex_core::error::Result<()> {
+        let mut stream = vec![b'x'; garbage_len];
+        stream.extend_from_slice(MAGIC_PREAMBLE);
+        FrameReader::new(Cursor::new(stream)).scan_preamble()
+    }
+    // The budget is inclusive: exactly MAX_PREAMBLE_SCAN_BYTES of garbage is
+    // tolerated (4095 and 4096 succeed); one byte more (4097) fails.
+    assert!(scan_after(MAX_PREAMBLE_SCAN_BYTES - 1).is_ok());
+    assert!(scan_after(MAX_PREAMBLE_SCAN_BYTES).is_ok());
+    assert!(scan_after(MAX_PREAMBLE_SCAN_BYTES + 1).is_err());
 }
 
 #[test]

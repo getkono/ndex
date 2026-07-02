@@ -64,8 +64,9 @@ the shell has no mise activation.
 | `fmt-check` | both of the above with `--check` (CI-safe, no writes) |
 | `lint` | `typos`, `actionlint`, `cargo deny check` |
 | `doc` | `cargo doc --workspace --no-deps` |
+| `boundary` | fails if `cargo tree -p ndex -e normal --prefix none` lists any `ndex-{store,extract,embed,search,reconcile,remote}` — the automated client/engine [boundary guard](../00-architecture.md) |
 | `hooks-install` (alias `hooks`) | `hk install` |
-| `ci` | depends on `fmt-check`, `lint`, `clippy`, `test` — the local gate |
+| `ci` | depends on `fmt-check`, `lint`, `clippy`, `boundary`, `test` — the local gate |
 
 Note: the `ci` task does **not** include `build` or `doc`; the GitHub pipeline runs
 `build` as an explicit extra step ([72-ci](72-ci.md)).
@@ -98,7 +99,8 @@ Stable-channel options only (no nightly-gated keys): `edition = "2024"`,
 
 ### 5.2 `taplo.toml` ✅
 
-`[formatting]`: `align_entries = false`, `column_width = 100`,
+`exclude = ["target/**"]` — build artifacts contain generated Cargo.tomls that must
+never be formatted. `[formatting]`: `align_entries = false`, `column_width = 100`,
 `indent_string = "    "` (4 spaces), `reorder_keys = false`.
 
 ### 5.3 `typos.toml` ✅
@@ -115,9 +117,9 @@ Run as part of `mise run lint` (local + CI).
 
 | Section | Policy |
 |---|---|
-| `[advisories]` | version 2; `yanked = "deny"`. |
-| `[licenses]` | version 2; `confidence-threshold = 0.9`; allow-list: MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-2-Clause, BSD-3-Clause, ISC, Unicode-3.0, Zlib, MPL-2.0, CC0-1.0. |
-| `[bans]` | `multiple-versions = "warn"`, `wildcards = "deny"`. No named-crate bans (in particular, none guarding the client/engine boundary — [00-architecture](../00-architecture.md) §3). |
+| `[advisories]` | version 2; `yanked = "deny"`; six dated `ignore` entries, each with an in-file justification and a stated re-evaluation condition: RUSTSEC-2026-0190 (anyhow `downcast_mut` unsoundness, unused API), RUSTSEC-2026-0186 (memmap2, crate declared but unused), RUSTSEC-2024-0436 (paste unmaintained, compile-time only via tokenizers), RUSTSEC-2026-0194 + RUSTSEC-2026-0195 (quick-xml DoS via pdf_oxide→office_oxide — **must be revisited before the PDF/DOCX extractors go live**), RUSTSEC-2026-0192 (ttf-parser unmaintained via pdf_oxide). |
+| `[licenses]` | version 2; `confidence-threshold = 0.9`; allow-list: MIT, Apache-2.0, Apache-2.0 WITH LLVM-exception, BSD-2-Clause, BSD-3-Clause, ISC, Unicode-3.0, Zlib, MPL-2.0, CC0-1.0, BSL-1.0. Per-crate `exceptions`: libbz2-rs-sys (bzip2-1.0.6), libfuzzer-sys (NCSA), webpki-root-certs (CDLA-Permissive-2.0). |
+| `[bans]` | `multiple-versions = "warn"`, `wildcards = "deny"` with `allow-wildcard-paths = true` (internal path deps carry no version by design; combined with workspace `publish = false` so cargo-deny treats them as private). No named-crate bans; the client/engine boundary is guarded by the `boundary` mise task (§3.2), not by deny rules — [00-architecture](../00-architecture.md) §3. |
 | `[sources]` | `unknown-registry = "deny"`, `unknown-git = "deny"`. |
 
 ## 7. `.gitignore` policy ✅
@@ -141,6 +143,7 @@ Run as part of `mise run lint` (local + CI).
 | `edition` | `2024` | Requires Rust ≥ 1.85. |
 | `rust-version` | `1.88` | **Dependency floor, not edition floor:** in-file comment states ort/tantivy/zip/pdf_oxide require ≥ 1.88. Declared but never validated by any build ([72-ci](72-ci.md) has no MSRV job). |
 | `version` | `0.1.0` | Single workspace-wide version ([73-release](73-release.md)). |
+| `publish` | `false` | Internal crates, never published to crates.io; every crate inherits via `publish.workspace = true`. Also makes cargo-deny's `allow-wildcard-paths` apply (§6). |
 | `license` | MIT | |
 | `authors` | Justin Chung | |
 | `repository` | `https://github.com/justy/ndex` | See Divergences — does not match the actual remote. |

@@ -42,8 +42,14 @@ fn dir_entry(meta: &std::fs::Metadata) -> DirWalkEntry {
 
 /// Walk `root` via the `ignore` crate, honoring `.gitignore`/`.ndexignore`, skipping non-regular
 /// files, and recording filesystem metadata for files and directories (PRD §11.1).
+///
+/// Symlink containment (PRD §11.4): symlinked entries whose canonicalized target escapes
+/// the canonicalized root are skipped (with their subtrees), so a link to e.g. `/etc`
+/// never pulls outside content into the index. Symlinks resolving *within* the root are
+/// followed normally when `walk.follow_symlinks` is on.
 pub fn walk(root: &Path, config: &Config) -> Result<WalkOutcome> {
     let outcome = WalkOutcome::default();
+    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
 
     let mut builder = ignore::WalkBuilder::new(root);
     builder
@@ -57,10 +63,35 @@ pub fn walk(root: &Path, config: &Config) -> Result<WalkOutcome> {
     if config.ignore.respect_ndexignore {
         builder.add_custom_ignore_filename(NDEXIGNORE_FILE);
     }
-    // Never descend into our own index directory (or the reindex staging copy).
-    builder.filter_entry(|entry| {
+    // Never descend into our own index directory (or the reindex staging copy), and
+    // never follow a symlink whose target resolves outside the root (containment).
+    builder.filter_entry(move |entry| {
         let name = entry.file_name();
-        name != std::ffi::OsStr::new(NDEX_DIR) && name != std::ffi::OsStr::new(NDEX_OLD_DIR)
+        if name == std::ffi::OsStr::new(NDEX_DIR) || name == std::ffi::OsStr::new(NDEX_OLD_DIR) {
+            return false;
+        }
+        if !entry.path_is_symlink() {
+            return true;
+        }
+        match std::fs::canonicalize(entry.path()) {
+            Ok(target) if target.starts_with(&canon_root) => true,
+            Ok(target) => {
+                tracing::debug!(
+                    path = %entry.path().display(),
+                    target = %target.display(),
+                    "skipping symlink escaping the index root"
+                );
+                false
+            }
+            Err(err) => {
+                tracing::debug!(
+                    path = %entry.path().display(),
+                    %err,
+                    "skipping unresolvable symlink"
+                );
+                false
+            }
+        }
     });
 
     for result in builder.build() {

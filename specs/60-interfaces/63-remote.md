@@ -11,7 +11,7 @@
 - `crates/ndex-remote/src/progress.rs`
 - `crates/ndex-remote/src/commands/{mod,completions,indexing,maintain,model,read}.rs`
 - `crates/ndex-remote/Cargo.toml`
-- Tests: `crates/ndex-remote/tests/{cli,characterization,integration}.rs`
+- Tests: `crates/ndex-remote/tests/{cli,characterization,integration,crash}.rs`
 
 Engine behavior lives elsewhere: store open/create in [21-layout-and-locking.md](../20-store/21-layout-and-locking.md), the reconcile pipeline in [31-reconcile.md](../30-ingest/31-reconcile.md), search execution in [41-search.md](../40-search/41-search.md), snippets in [23-fts.md](../20-store/23-fts.md), model registry in [34-embedding.md](../30-ingest/34-embedding.md). Wire framing/handshake/messages are the 50-series docs. This doc owns only what the binary does at its boundary.
 
@@ -67,7 +67,7 @@ Unlike the client, there are no `--color`/`--config`/SSH globals: the server has
 
 ### 3.3 v0.2 stubs ✅
 
-`tag`/`dedup`/`compact` → `commands::unavailable_v0_2(name)` (`crates/ndex-remote/src/commands/mod.rs`), a byte-for-byte copy of the client helper: `NdexError::Other("'ndex {command}' is planned for v0.2 and not yet available.")` → stderr + the general-error exit ([14-errors.md](../10-core/14-errors.md)). Locked by `v0_2_commands_are_unavailable_with_exit_1` (`tests/cli.rs`) and `unavailable_v0_2_is_a_clear_error` (`tests/characterization.rs`). Note the message says `ndex tag`, not `ndex-remote tag` (see Divergences).
+`tag`/`dedup`/`compact` → `commands::unavailable_v0_2(name)` (`crates/ndex-remote/src/commands/mod.rs`): `NdexError::Other("'ndex-remote {command}' is planned for v0.2 and not yet available.")` → stderr + the general-error exit ([14-errors.md](../10-core/14-errors.md)). Locked by `v0_2_commands_are_unavailable_with_exit_1` (`tests/cli.rs`) and `unavailable_v0_2_is_a_clear_error` (`tests/characterization.rs`). (The message names this binary; the client helper's says `ndex {command}` — [61-client-cli.md](61-client-cli.md).)
 
 ### 3.4 Dispatch ✅ (`ndex_remote::run`, `crates/ndex-remote/src/lib.rs`)
 
@@ -134,7 +134,7 @@ Builds the immutable index identity ([`IndexIdentity`](../10-core/11-data-model.
 | Field | `--model none` | `--model default` (or explicit name) |
 |---|---|---|
 | `model_name` | `"none"` | registry `full_name` — `default` aliases to `arctic`, then [`ndex_embed::lookup`](../30-ingest/34-embedding.md) |
-| `model_hash` | `""` | registry `onnx_blake3` |
+| `model_hash` | `""` | registry `onnx_blake3` if pinned, else `""` — **empty = unpinned** ([34-embedding.md](../30-ingest/34-embedding.md); a placeholder is never baked into the immutable identity) |
 | `dimensions` / `mrl_dimensions` | `0` / `0` | from registry |
 | `vector_scalar` | `"f16"` | `"f16"` |
 | `hnsw_m` / `hnsw_ef_construction` | `32` / `200` | `32` / `200` |
@@ -143,14 +143,14 @@ Plus, always: `schema_version = SCHEMA_VERSION`, `created_by = "ndex-remote {CAR
 
 Output (exact): `Initialized ndex index at {path}/.ndex (model: {model})` — prints the raw `--model` string (`default`, not the resolved `arctic`).
 
-**Ignored flags:** `--exclude`, `--no-fts`, `--no-meta` parse but are never read by the handler — ⛔ (see Divergences).
+**Unimplemented flags warn:** `--exclude`, `--no-fts`, `--no-meta` are still not consumed by the handler ⛔, but each *used* flag now emits one stderr line before init proceeds (exact): `warning: --<flag> is not implemented in v0.1; ignoring` (e.g. `warning: --no-fts is not implemented in v0.1; ignoring`). Locked by `init_warns_on_unimplemented_flags` (`tests/cli.rs`). See Divergences.
 
 ### 5.2 `index` ✅ (`commands/indexing.rs`)
 
-`Store::open(path)`, then either:
+`Store::try_open(path)` — the **non-blocking** exclusive open ([21-layout-and-locking.md](../20-store/21-layout-and-locking.md)). If another process holds the index lock, `index` fails fast instead of queueing behind the writer: `NdexError::Lock` (general-error exit — [14-errors.md](../10-core/14-errors.md)) with message (exact) `another ndex process holds the index lock at {path}/.ndex/lock; retry after it finishes`. Locked by `index_fails_fast_when_lock_is_held` (`tests/cli.rs`, which holds the flock in-process via `ndex_store::IndexLock`). This applies to `--status` too. Then either:
 
 - **`--status`** — prints `{n} files indexed; last reconciled at {ns} ns` or `{n} files indexed; never reconciled` (from `manifest.live_files()` / `last_reconciliation_ns()`) and exits.
-- Otherwise builds `ReconcileOptions` from the flags (`jobs`/`batch_size` cast u32→usize; `max_file_size` parsed as [`ByteSize`](../10-core/13-config.md) with **parse failures silently discarded** via `.ok()`), runs `Reconciler::new(&mut store, None).run(&options, &NullSink)` ([31-reconcile.md](../30-ingest/31-reconcile.md)) with no progress reporting, and prints the summary (exact):
+- Otherwise builds `ReconcileOptions` from the flags (`jobs`/`batch_size` cast u32→usize; `max_file_size` parsed as [`ByteSize`](../10-core/13-config.md) — an unparsable value is `NdexError::Config("invalid --max-file-size: {parse error}")`, the configuration-error exit ([14-errors.md](../10-core/14-errors.md)), locked by `index_with_unparsable_max_file_size_is_a_config_error` in `tests/cli.rs`), runs `Reconciler::new(&mut store, None).run(&options, &NullSink)` ([31-reconcile.md](../30-ingest/31-reconcile.md)) with no progress reporting, and prints the summary (exact):
 
 ```
 {new} new, {modified} modified, {deleted} deleted, {unchanged} unchanged, {processed} processed, {failed} failed ({duration_ms} ms)
@@ -170,7 +170,9 @@ The PRD §13.6 `.ndex/` → `.ndex.old/` swap-and-rebuild flow is 📋. All four
 
 ### 5.4 `search` 🚧 (`commands/read.rs`)
 
-`Store::open(path)` → `ndex_search::run(&store, None, query, mode, &SearchFilters::default(), limit, offset)` ([41-search.md](../40-search/41-search.md)). Mode parsing (`parse_mode`): exact strings `fts` / `semantic` / `hybrid`; **anything else — including typos — silently becomes `Auto`**.
+`Store::open_read(path)` — the shared-lock, read-only open ([21-layout-and-locking.md](../20-store/21-layout-and-locking.md)); searches no longer contend for the exclusive writer lock. Then `ndex_search::run(&store, None, query, mode, &SearchFilters::default(), limit, offset)` ([41-search.md](../40-search/41-search.md)). Mode parsing (`parse_mode`): exact strings `fts` / `semantic` / `hybrid`; **anything else — including typos — silently becomes `Auto`**.
+
+**Warnings:** every `SearchOutcome.warnings` entry (degradation warnings from mode resolution; strings owned by [41-search.md §2.1](../40-search/41-search.md)) is printed to **stderr**, one line each, before any result output (exact): `warning: {warning}`.
 
 Output:
 
@@ -191,7 +193,7 @@ Output:
 
 ### 5.5 `info` 🚧 (`commands/read.rs`)
 
-`Store::open` → `manifest.get_by_path(NdexPath::from_os_str(file))`; a miss → `NdexError::Other("not in index: {file}")` (general-error exit — [14-errors.md](../10-core/14-errors.md)). Output (exact, aligned):
+`Store::open_read` ([21-layout-and-locking.md](../20-store/21-layout-and-locking.md)) → `manifest.get_by_path(NdexPath::from_os_str(file))`; a miss → `NdexError::Other("not in index: {file}")` (general-error exit — [14-errors.md](../10-core/14-errors.md)). Output (exact, aligned):
 
 ```
 path:    {path}
@@ -205,7 +207,7 @@ PRD §13.5 additionally specifies mtime, blake3, tags, doc/media metadata, chunk
 
 ### 5.6 `stats` 🚧 (`commands/read.rs`)
 
-Output (exact):
+`Store::open_read` ([21-layout-and-locking.md](../20-store/21-layout-and-locking.md)). Output (exact):
 
 ```
 index:  {path}/.ndex
@@ -254,21 +256,26 @@ Bridges core progress types ([15-search-and-progress-types.md](../10-core/15-sea
 
 ## 8. Test-pinned end-to-end behavior
 
-`init_index_search_roundtrip` (`crates/ndex-remote/tests/integration.rs`) is the only live end-to-end test and pins the standalone pipeline: init succeeds on a fresh dir; index reports `2 new`/`2 processed`/`0 failed`; FTS search finds a file by content; `--format paths` emits the bare path; a no-match query exits 0; re-index reports `2 unchanged`; stats prints `files:`. Four sibling tests are `#[ignore]`d pending features: all-formats coverage, crash recovery, sidecar repair, SSH roundtrip.
+`init_index_search_roundtrip` (`crates/ndex-remote/tests/integration.rs`) pins the standalone pipeline: init succeeds on a fresh dir; index reports `2 new`/`2 processed`/`0 failed`; FTS search finds a file by content; `--format paths` emits the bare path; a no-match query exits 0; re-index reports `2 unchanged`; stats prints `files:`. Three sibling tests are `#[ignore]`d pending features: all-formats coverage, sidecar repair, SSH roundtrip.
+
+`sigkill_mid_index_then_rerun_preserves_crash_safety_invariant` (`crates/ndex-remote/tests/crash.rs`, unix-only) is the durability regression gate: it SIGKILLs a live `index` child mid-run and pins the [31-reconcile.md](../30-ingest/31-reconcile.md) crash-safety invariant end-to-end (test mechanics inventoried in [80-testing.md](../80-testing.md)).
+
+Binary-observed exit codes (`tests/cli.rs`, pinned against the [14-errors.md](../10-core/14-errors.md) table): `search`/`stats` on an index-less directory → `IndexNotFound` (`search_and_stats_without_index_exit_3`); re-`init` on an initialized root → `Other`/general error (`init_on_initialized_root_exits_1`); `index --max-file-size garbage` → `Config` (`index_with_unparsable_max_file_size_is_a_config_error`); `index` under a held lock → `Lock`/general error (`index_fails_fast_when_lock_is_held`).
 
 ## Divergences & open questions
 
 1. **`--log-file` is dead** — declared in `cli.rs` with a PRD §17 citation and `tracing-appender` in `Cargo.toml`, but `main.rs` never wires it. Either wire it or drop flag + dependency.
-2. **`--enable-ner` silent** — PRD §13.3 requires the warning `"NER is not available in v0.1. Flag ignored."`; the handler reads nothing and warns nothing.
-3. **`--max-file-size` swallows garbage** — `parse::<ByteSize>().ok()` means `--max-file-size banana` behaves as if the flag were absent, with no diagnostic.
-4. **`init` ignores `--exclude`/`--no-fts`/`--no-meta`** — parsed, documented in help, never consumed; an index created with `--no-fts` still gets FTS.
-5. **`search --format` mostly cosmetic** — only `paths` changes output; `json`/`jsonl`/`csv`/`plain` silently produce the default list, and ANSI bold from `render_snippet` is emitted even when piped. `--explain` is a no-op.
-6. **`parse_mode` typo-forgiving** — `--mode semnatic` silently searches in `auto` mode; a `ValueEnum` or an error would surface the mistake.
-7. **`reindex` contradicts PRD §13.6** — no `.ndex/`→`.ndex.old/` atomic rebuild; deliberate general-error failure instead (message in §5.3).
-8. **`info`/`stats` far thinner than PRD §13.5** — missing fields listed in §5.5/§5.6; `info -f json` accepted but ignored; remote `stats` has no `--format` flag while the client's does.
-9. **Stub message says `ndex`, not `ndex-remote`** — `unavailable_v0_2` was copy-pasted from the client, so `ndex-remote tag` reports `'ndex tag' is planned for v0.2…`.
-10. **`verify` flag naming split** — server `--path-glob` (single) vs client `--path` (repeatable) vs PRD `--path <GLOB>`; the wire type takes `Option<Vec<…>>` ([53-messages.md](../50-protocol/53-messages.md)). Three surfaces, three shapes.
-11. **`init` echoes the alias** — prints `model: default` rather than the resolved registry name stored in `index.toml`.
-12. **`model fetch arctic --all`** — a positional default plus `--all` can both apply; precedence unspecified.
-13. **Unused dependencies** — `rustix`, `rayon`, `crossbeam-channel`, `rmp-serde` are declared but unreferenced in `src/` (scaffolding for the serve loop and signal handling).
-14. **No results ⇒ stderr** — `No results.` goes to stderr while all other search output goes to stdout; fine for piping but undocumented, and the server CLI has no analog to the client's `--fail-no-results` flag (`NdexError::NoResults` — [14-errors.md](../10-core/14-errors.md)).
+2. **`--enable-ner` silent** — PRD §13.3 requires the warning `"NER is not available in v0.1. Flag ignored."`; the handler reads nothing and warns nothing (unlike the `init` flags, §5.1, which now warn).
+3. **`init` still doesn't implement `--exclude`/`--no-fts`/`--no-meta`** *(reduced — each used flag now warns on stderr, §5.1)* — the flags remain unconsumed; an index created with `--no-fts` still gets FTS.
+4. **`search --format` mostly cosmetic** — only `paths` changes output; `json`/`jsonl`/`csv`/`plain` silently produce the default list, and ANSI bold from `render_snippet` is emitted even when piped. `--explain` is a no-op.
+5. **`parse_mode` typo-forgiving** — `--mode semnatic` silently searches in `auto` mode; a `ValueEnum` or an error would surface the mistake.
+6. **`reindex` contradicts PRD §13.6** — no `.ndex/`→`.ndex.old/` atomic rebuild; deliberate general-error failure instead (message in §5.3).
+7. **`info`/`stats` far thinner than PRD §13.5** — missing fields listed in §5.5/§5.6; `info -f json` accepted but ignored; remote `stats` has no `--format` flag while the client's does.
+8. **`verify` flag naming split** — server `--path-glob` (single) vs client `--path` (repeatable) vs PRD `--path <GLOB>`; the wire type takes `Option<Vec<…>>` ([53-messages.md](../50-protocol/53-messages.md)). Three surfaces, three shapes.
+9. **`init` echoes the alias** — prints `model: default` rather than the resolved registry name stored in `index.toml`.
+10. **`model fetch arctic --all`** — a positional default plus `--all` can both apply; precedence unspecified.
+11. **Unused dependencies** — `rustix`, `rayon`, `crossbeam-channel`, `rmp-serde` are declared but unreferenced in `src/` (scaffolding for the serve loop and signal handling).
+12. **No results ⇒ stderr** — `No results.` goes to stderr while all other search output goes to stdout; fine for piping but undocumented, and the server CLI has no analog to the client's `--fail-no-results` flag (`NdexError::NoResults` — [14-errors.md](../10-core/14-errors.md)).
+13. **`init` can still block on the lock** — `Store::create` uses the blocking exclusive acquire; a partially-created `.ndex/` (lock file but no `index.toml`) held by another process would stall `init` indefinitely. Vanishingly narrow (requires create-debris plus a concurrent holder), but `index` now fails fast (§5.2) while `init` does not.
+
+Resolved (this revision): `--max-file-size` no longer swallows unparsable values (§5.2); the v0.2 stub message now says `ndex-remote` (§3.3); search warnings are surfaced on stderr (§5.4); `init`'s unimplemented flags warn (§5.1); read commands no longer take the exclusive lock (§5.4–§5.6).

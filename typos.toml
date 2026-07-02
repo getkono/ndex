@@ -6,9 +6,9 @@ extend-exclude = ["tests/fixtures/**", "*.onnx", "Cargo.lock"]
 # Domain vocabulary that must not be "corrected".
 ndex = "ndex"
 arctic = "arctic"
-restat = "restat"  # re-running stat() (TOCTOU guard, reconcile process)
-flate = "flate"    # the flate2 compression crate
-caf = "caf"         # fragment of "café" in NFC normalization test data
+restat = "restat" # re-running stat() (TOCTOU guard, reconcile process)
+flate = "flate"   # the flate2 compression crate
+caf = "caf"       # fragment of "café" in NFC normalization test data
 
 [default.extend-identifiers]
 # Crate/identifier names that resemble typos.
